@@ -226,6 +226,7 @@ export interface ElectronAPI {
   setModel: (modelId: string) => Promise<{ success: boolean; error?: string }>;
   setDefaultModel: (modelId: string) => Promise<{ success: boolean; error?: string }>;
   toggleModelSelector: (coords: { x: number; y: number }) => Promise<void>;
+  modelSelectorCloseIfOpen: () => Promise<void>;
   forceRestartOllama: () => Promise<void>;
 
   // Settings Window
@@ -321,6 +322,17 @@ export interface ElectronAPI {
   onKeybindsUpdate: (callback: (keybinds: Array<any>) => void) => () => void
   onKeybindRegistrationFailed: (callback: (data: { id: string; accelerator: string }) => void) => () => void
   onGlobalShortcut: (callback: (data: { action: string }) => void) => () => void
+
+  // CGEventTap-backed stealth typing (macOS only — graceful degradation elsewhere)
+  stealthTapAvailable: () => Promise<boolean>
+  stealthTapPermissionGranted: () => Promise<boolean>
+  stealthTapRequestPermission: () => Promise<boolean>
+  stealthTapOpenSettings: () => Promise<void>
+  stealthTapIsActive: () => Promise<boolean>
+  stealthTapStop: () => Promise<void>
+  stealthTapStart: () => Promise<boolean>
+  onStealthTapState: (cb: (state: { active: boolean; reason?: string }) => void) => () => void
+  onStealthKeyCaptured: (cb: (ev: { keyCode: number; chars: string; flags: number; isKeyDown: boolean }) => void) => () => void
 
   // Profile Engine API
   profileUploadResume: (filePath: string) => Promise<{ success: boolean; error?: string }>

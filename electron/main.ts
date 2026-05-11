@@ -250,6 +250,13 @@ export class AppState {
 
   private hasDebugged: boolean = false
   private isMeetingActive: boolean = false; // Guard for session state leaks
+  // True between Stop click and the end of STT drain. The transcript handler
+  // (and only the transcript handler) treats `isMeetingActive || _isDraining`
+  // as "accept trailing finals" — every other call site looks at
+  // `isMeetingActive` alone, which flips to false synchronously on Stop so the
+  // launcher's "Meeting ongoing" pill switches back to "Start Natively" the
+  // instant the user clicks Stop, with no 250 ms green-→-blue stutter.
+  private _isDraining: boolean = false;
   // Tracks remembered output device so reconfigureAudio can no-op when nothing changed.
   // Mirrors the existing _lastRequestedInputDeviceId for the input side.
   private _lastRequestedOutputDeviceId: string | undefined = undefined;
@@ -326,6 +333,30 @@ export class AppState {
       this.updateTrayMenu();
     });
 
+    // Stealth keyboard tap (CGEventTap) IPC. Renderer drives the permission
+    // flow + queries availability/state; the tap itself is toggled by the
+    // global shortcut handler above. Only registered on macOS — on other
+    // platforms these handlers no-op so the renderer can render fallback UI.
+    if (process.platform === 'darwin') {
+      const { StealthKeyboardManager } = require('./services/StealthKeyboardManager');
+      const stealth = StealthKeyboardManager.getInstance();
+      ipcMain.handle('stealth-tap:available', () => stealth.isAvailable());
+      ipcMain.handle('stealth-tap:permission-granted', () => stealth.isPermissionGranted());
+      ipcMain.handle('stealth-tap:request-permission', () => stealth.requestPermission());
+      ipcMain.handle('stealth-tap:open-settings', () => { stealth.openSettings(); });
+      ipcMain.handle('stealth-tap:is-active', () => stealth.isActive());
+      ipcMain.handle('stealth-tap:stop', () => { stealth.stop(); });
+      ipcMain.handle('stealth-tap:start', () => stealth.start());
+    } else {
+      ipcMain.handle('stealth-tap:available', () => false);
+      ipcMain.handle('stealth-tap:permission-granted', () => false);
+      ipcMain.handle('stealth-tap:request-permission', () => false);
+      ipcMain.handle('stealth-tap:open-settings', () => {});
+      ipcMain.handle('stealth-tap:is-active', () => false);
+      ipcMain.handle('stealth-tap:stop', () => {});
+      ipcMain.handle('stealth-tap:start', () => false);
+    }
+
     keybindManager.onShortcutTriggered(async (actionId) => {
       console.log(`[Main] Global shortcut triggered: ${actionId}`);
       try {
@@ -373,6 +404,37 @@ export class AppState {
         // --- STEALTH SHORTCUTS: no focus, no show, pure IPC dispatch ---
 
         // Chat actions — fire into the renderer without focusing the window
+        } else if (actionId === 'chat:focusInput') {
+          // Toggle CGEventTap-backed stealth typing mode. While engaged, every
+          // keystroke is captured at the OS event-pipeline layer and routed to
+          // the renderer; the foreground app (Zoom/browser/etc.) does NOT
+          // receive any key events and never loses key/frontmost status. This
+          // is the only path that delivers true Cluely-grade undetectability
+          // on macOS — NSPanel-nonactivating gets us 90% there, the tap closes
+          // the remaining gap (the panel never even has to become key-window).
+          //
+          // Falls back to plain panel.focus() if the native tap is unavailable
+          // (no rebuild yet, no Accessibility permission, or non-macOS).
+          this.showMainWindow(true);
+          const overlay = this.windowHelper.getOverlayWindow();
+          if (overlay && !overlay.isDestroyed()) {
+            overlay.webContents.send('ensure-expanded');
+          }
+
+          if (process.platform === 'darwin') {
+            const { StealthKeyboardManager } = require('./services/StealthKeyboardManager');
+            const mgr = StealthKeyboardManager.getInstance();
+            if (mgr.isAvailable()) {
+              mgr.toggle();
+              return; // tap is the input path; no need to focus the panel
+            }
+          }
+
+          // Fallback: panel-safe focus on macOS without tap, brief focus on Win.
+          if (overlay && !overlay.isDestroyed()) {
+            overlay.webContents.send('global-shortcut', { action: 'focusInput' });
+            overlay.focus();
+          }
         } else if (
           actionId === 'chat:whatToAnswer' ||
           actionId === 'chat:clarify' ||
@@ -951,7 +1013,11 @@ export class AppState {
 
     // Wire Transcript Events
     stt.on('transcript', (segment: { text: string, isFinal: boolean, confidence: number }) => {
-      if (!this.isMeetingActive) {
+      // Accept transcripts while a meeting is active OR while we're draining
+      // trailing finals after Stop. `_isDraining` covers the ~250 ms grace
+      // window between Stop click and STT socket close so the user's last
+      // sentence isn't silently dropped.
+      if (!this.isMeetingActive && !this._isDraining) {
         return;
       }
 
@@ -996,6 +1062,18 @@ export class AppState {
     let _lastState: 'connected' | 'reconnecting' | 'failed' = 'reconnecting';
 
     stt.on('error', (err: Error) => {
+      // Google streamingRecognize's 10s silence timeout closes the stream
+      // with gRPC code 11 ("Audio Timeout Error"). GoogleSTT already
+      // swallows this case before it reaches us, but other providers may
+      // surface a similar idle-timeout that the lazy-reconnect path
+      // recovers from cleanly. Downgrade to a one-liner here as well so
+      // a stray bubble-up doesn't cascade into stack-trace noise.
+      const grpcCode = (err as any)?.code;
+      if (grpcCode === 11 || /Audio Timeout Error/i.test(err.message || '')) {
+        console.warn(`[Main] STT (${speaker}) idle-timed-out (provider's no-audio limit), reconnecting on next chunk.`);
+        return;
+      }
+
       console.error(`[Main] STT (${speaker}) Error:`, err);
 
       // Extract richer error info from Axios errors (RestSTT)
@@ -1137,6 +1215,31 @@ export class AppState {
         if (this.systemAudioCapture !== capture) return; // capture was replaced
         if (chunkCount > 0) return;                       // already producing
         if (!this.isMeetingActive) return;                // meeting ended
+
+        // Bluetooth devices like AirPods register with separate identifiers
+        // for input (cpal device name) and output (CoreAudio UID with
+        // optional :input/:output suffix). When the user has the same
+        // physical device on both sides of the pipeline, macOS cannot run a
+        // CoreAudio Process Tap on it while it's also the active microphone
+        // — the tap initializes "successfully" but every IO callback yields
+        // zero frames. The 8s watchdog is the most reliable signal we get.
+        // Surface the actual cause instead of a generic "route mismatch"
+        // hint so the user knows what to change.
+        const sameDeviceName = this.detectSameInputOutputDevice();
+        if (sameDeviceName) {
+          const msg = `Silent capture detected — input and output are the same device (${sameDeviceName}). macOS cannot tap a device while it is also the active microphone. Switch input to built-in mic or output to built-in speakers.`;
+          console.warn(`${prefix}SystemAudioCapture ${msg}`);
+          this.broadcast('audio-capture-failed', {
+            channel: 'system',
+            message: msg,
+            attempt: 0,
+            maxAttempts: 3,
+            terminal: false,
+            stuck: true,
+          });
+          return;
+        }
+
         console.warn(`${prefix}SystemAudioCapture produced 0 chunks in 8s — likely silent capture (route mismatch or permission revoked).`);
         this.broadcast('audio-capture-failed', {
           channel: 'system',
@@ -1624,6 +1727,46 @@ export class AppState {
     if (!trimmed) return undefined;
     if (trimmed.toLowerCase() === 'default') return undefined;
     return trimmed;
+  }
+
+  /**
+   * Detect the case where the requested input and output devices are the same
+   * physical hardware (typically AirPods on both sides). Input IDs come from
+   * cpal (device name), output IDs come from CoreAudio (UID with optional
+   * :input/:output suffix), so direct string comparison won't catch the
+   * conflict. We resolve the output UID to a friendly name via
+   * AudioDevices.getOutputDevices() and compare it to the input name (case-
+   * insensitive). Returns the friendly name when a same-device conflict is
+   * detected, undefined otherwise.
+   */
+  private detectSameInputOutputDevice(): string | undefined {
+    const inputId = this._lastRequestedInputDeviceId;
+    const outputId = this._lastRequestedOutputDeviceId;
+    if (!inputId || !outputId) return undefined;
+
+    // Strip the macOS CoreAudio :input/:output suffix before any comparison —
+    // a single Bluetooth device can appear with both suffixes.
+    const stripSuffix = (s: string) => s.replace(/:(input|output)$/i, '');
+    const inputBase = stripSuffix(inputId).toLowerCase();
+    const outputBase = stripSuffix(outputId).toLowerCase();
+    if (inputBase === outputBase) {
+      return stripSuffix(inputId);
+    }
+
+    // Resolve the output UID to its friendly name and compare to the input
+    // name (input IDs from cpal ARE the device name, e.g. "Evin's AirPods Pro").
+    try {
+      const outputs = AudioDevices.getOutputDevices();
+      const outputMatch = outputs.find(d => stripSuffix(d.id).toLowerCase() === outputBase);
+      if (outputMatch && outputMatch.name) {
+        if (outputMatch.name.toLowerCase() === inputId.toLowerCase()) {
+          return outputMatch.name;
+        }
+      }
+    } catch {
+      // Native module unavailable — fall through to "no conflict detected".
+    }
+    return undefined;
   }
 
   private async reconfigureAudio(inputDeviceId?: string | null, outputDeviceId?: string | null): Promise<void> {
@@ -2289,16 +2432,26 @@ export class AppState {
       // dialog itself when it first attempts to access screen content.
     }
 
+    // Reset overlay position BEFORE the switch so the new meeting starts in
+    // a predictable centered position regardless of where the previous
+    // session left it. (Moved up from below so setWindowMode('overlay') reads
+    // the reset bounds.)
+    this.windowHelper.resetOverlayPosition();
+
+    // ─── WINDOW SWAP BEFORE STATE BROADCAST ───────────────────────────────
+    // Switch to the overlay BEFORE flipping `isMeetingActive` to true. If we
+    // broadcast meeting-state-changed:{isActive:true} while the launcher is
+    // still visible, the launcher's CTA pill briefly crossfades blue→green
+    // before the renderer's follow-up setWindowMode('overlay') hides it —
+    // visible as a flash. Switching first means the launcher hides before
+    // the state event arrives, so the user only ever sees the overlay.
+    this.windowHelper.setWindowMode('overlay');
+
     this.isMeetingActive = true;
     this.broadcastMeetingState()
     if (metadata) {
       this.intelligenceManager.setMeetingMetadata(metadata);
     }
-
-    // Reset overlay position to default center so each new meeting starts
-    // with the overlay in a predictable centered position, regardless of where
-    // the user moved it during the previous meeting session.
-    this.windowHelper.resetOverlayPosition();
 
     // Emit session reset to clear UI state immediately
     this.getWindowHelper().getOverlayWindow()?.webContents.send('session-reset');
@@ -2370,6 +2523,28 @@ export class AppState {
       this.setOverlayMousePassthrough(false);
     }
 
+    // ─── UX STATE FLIP — SYNCHRONOUS ───────────────────────────────────────
+    // Flip the UX-facing meeting flag to false RIGHT NOW and broadcast. The
+    // launcher's "Meeting ongoing" pill subscribes to meeting-state-changed,
+    // so this guarantees the pill reverts to "Start Natively" the moment the
+    // user clicks Stop — no green→blue flash if they click Start again before
+    // the 250 ms STT drain finishes. The transcript handler keys off
+    // `_isDraining` instead so trailing finals are still accepted.
+    this.isMeetingActive = false;
+    this._isDraining = true;
+    this.broadcastMeetingState();
+
+    // ─── WINDOW SWAP ───────────────────────────────────────────────────────
+    // Swap to the launcher BEFORE any audio teardown. The native monitor.stop()
+    // calls below are scheduled via setImmediate; libuv runs setImmediate
+    // callbacks on the very next tick AFTER this handler returns and BEFORE
+    // the next IPC message is processed. So if we did the window swap after
+    // (or relied on a follow-up setWindowMode IPC), the user would stare at
+    // the frozen overlay for 100–600 ms while the DSP/CoreAudio Tap/SCK
+    // threads joined. Calling switchToLauncher() here gets the show/hide
+    // commands to the OS compositor before the main thread blocks.
+    this.windowHelper.setWindowMode('launcher');
+
     // ─── SYNCHRONOUS: things the user expects "right now" on Stop click ────
     // Captures are deferred-stop wrappers (see SystemAudioCapture.stop /
     // MicrophoneCapture.stop) — they flip the JS-side isRecording flag
@@ -2387,33 +2562,38 @@ export class AppState {
     this.googleSTT?.finalize?.();
     this.googleSTT_User?.finalize?.();
 
-    // Revert to Default Model — synchronous, no blocking I/O. The user
-    // expects the model UI to revert immediately on Stop.
-    try {
-      const { CredentialsManager } = require('./services/CredentialsManager');
-      const cm = CredentialsManager.getInstance();
-      const defaultModel = cm.getDefaultModel();
-      const all = [...(cm.getCurlProviders() || []), ...(cm.getCustomProviders() || [])];
-      console.log(`[Main] Reverting model to default: ${defaultModel}`);
-      this.processingHelper.getLLMHelper().setModel(defaultModel, all);
-      BrowserWindow.getAllWindows().forEach(win => {
-        if (!win.isDestroyed()) win.webContents.send('model-changed', defaultModel);
-      });
-    } catch (e) {
-      console.error('[Main] Failed to revert model:', e);
-    }
-
     // ─── BACKGROUND: STT drain + meeting save + RAG embed ────────────────
-    // Critical: isMeetingActive stays TRUE during the 250ms grace window
-    // because main.ts:932 (stt.on('transcript')) drops segments when isActive
-    // is false — without that guarantee, the user's last words vanish.
-    //
-    // We expose the in-flight teardown as `_pendingTeardown` so a fast
-    // start→stop→start sequence awaits this completion in startMeeting()
-    // before booting a new session on the (still-shared) STT instances.
+    // Note: `isMeetingActive` was already flipped to false synchronously above
+    // (so the launcher UI updates instantly). `_isDraining` is true during the
+    // 250 ms grace window so the transcript handler keeps accepting trailing
+    // finals — without that, the user's last sentence vanishes. We expose the
+    // in-flight teardown as `_pendingTeardown` so a fast start→stop→start
+    // sequence awaits this completion in startMeeting() before booting a new
+    // session on the (still-shared) STT instances.
     const ragManager = this.ragManager;
     this._pendingTeardown = (async () => {
       try {
+        // 0. Revert to Default Model. Moved into BG: getDefaultModel() and the
+        //    provider list reads touch disk, and the 'model-changed' broadcast
+        //    re-renders all open windows — both block the main thread/renderer
+        //    during the Stop-click critical path. Doing it here means the
+        //    revert lands ~250 ms after Stop, by which point the launcher is
+        //    already painted and the overlay is hidden, so the user never
+        //    sees a stutter.
+        try {
+          const { CredentialsManager } = require('./services/CredentialsManager');
+          const cm = CredentialsManager.getInstance();
+          const defaultModel = cm.getDefaultModel();
+          const all = [...(cm.getCurlProviders() || []), ...(cm.getCustomProviders() || [])];
+          console.log(`[Main] Reverting model to default: ${defaultModel}`);
+          this.processingHelper.getLLMHelper().setModel(defaultModel, all);
+          BrowserWindow.getAllWindows().forEach(win => {
+            if (!win.isDestroyed()) win.webContents.send('model-changed', defaultModel);
+          });
+        } catch (e) {
+          console.error('[Main] Failed to revert model:', e);
+        }
+
         // 1. Grace window for STT trailing finals (Google/Soniox/Deepgram all
         //    reply to finalize() within 100–200ms). 250ms is conservative.
         await new Promise(resolve => setTimeout(resolve, 250));
@@ -2422,9 +2602,10 @@ export class AppState {
         this.googleSTT?.stop();
         this.googleSTT_User?.stop();
 
-        // 3. Now safe to mark meeting inactive — STT delivered its finals.
-        this.isMeetingActive = false;
-        this.broadcastMeetingState();
+        // 3. STT is closed — no more transcripts can arrive. Stop accepting
+        //    them. (UX-facing `isMeetingActive` was flipped synchronously up
+        //    top; nothing to broadcast here.)
+        this._isDraining = false;
 
         // 4. Snapshot transcript + persist placeholder + queue title/summary LLM.
         //    intelligenceManager.stopMeeting itself runs LLM in background.
@@ -3761,6 +3942,27 @@ async function initializeApp() {
   app.on("before-quit", (event) => {
     console.log("App is quitting, cleaning up resources...");
     appState.setQuitting(true);
+
+    // ROUND 2 FIX (#9): synchronously stop the CGEventTap worker thread
+    // BEFORE V8 starts tearing down. The tap callback holds an
+    // Arc<ThreadsafeFunction> that calls into napi from a non-V8 thread;
+    // if V8 is mid-teardown when the callback runs, napi's release path
+    // crashes. stop() joins the worker, guaranteeing no in-flight callbacks
+    // remain by the time we return.
+    //
+    // ORDERING NOTE: this MUST happen before any subsequent napi-touching
+    // cleanup (cropper.dispose, ollama.stop, phoneMirror.dispose). Those
+    // can spawn their own native threads or release napi resources, which
+    // would race with our worker if it's still alive.
+    if (process.platform === 'darwin') {
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        const { StealthKeyboardManager } = require('./services/StealthKeyboardManager');
+        StealthKeyboardManager.getInstance().stop();
+      } catch (e) {
+        console.error('[main] Failed to stop StealthKeyboardManager during shutdown:', e);
+      }
+    }
 
     // Dispose CropperWindowHelper to clean up IPC listeners and prevent memory leaks
     // This is critical to prevent resource leaks and ensure proper cleanup

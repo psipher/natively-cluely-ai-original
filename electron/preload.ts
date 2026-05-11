@@ -163,6 +163,7 @@ interface ElectronAPI {
   setModel: (modelId: string) => Promise<{ success: boolean; error?: string }>
   setDefaultModel: (modelId: string) => Promise<{ success: boolean; error?: string }>
   toggleModelSelector: (coords: { x: number; y: number }) => Promise<void>
+  modelSelectorCloseIfOpen: () => Promise<void>
   forceRestartOllama: () => Promise<void>
 
   // Settings Window
@@ -272,6 +273,18 @@ interface ElectronAPI {
 
   // Global shortcut events (stealth: fired even when window is not focused)
   onGlobalShortcut: (callback: (data: { action: string }) => void) => () => void
+
+  // CGEventTap-backed stealth keyboard tap (macOS only). Returns false on
+  // non-macOS or when the native module / Accessibility permission is missing.
+  stealthTapAvailable: () => Promise<boolean>
+  stealthTapPermissionGranted: () => Promise<boolean>
+  stealthTapRequestPermission: () => Promise<boolean>
+  stealthTapOpenSettings: () => Promise<void>
+  stealthTapIsActive: () => Promise<boolean>
+  stealthTapStop: () => Promise<void>
+  stealthTapStart: () => Promise<boolean>
+  onStealthTapState: (cb: (state: { active: boolean; reason?: string }) => void) => () => void
+  onStealthKeyCaptured: (cb: (ev: { keyCode: number; chars: string; flags: number; isKeyDown: boolean }) => void) => () => void
 
   // Donation API
   getDonationStatus: () => Promise<{ shouldShow: boolean; hasDonated: boolean; lifetimeShows: number }>;
@@ -933,6 +946,7 @@ contextBridge.exposeInMainWorld("electronAPI", {
   setModel: (modelId: string) => ipcRenderer.invoke('set-model', modelId),
   setDefaultModel: (modelId: string) => ipcRenderer.invoke('set-default-model', modelId),
   toggleModelSelector: (coords: { x: number; y: number }) => ipcRenderer.invoke('toggle-model-selector', coords),
+  modelSelectorCloseIfOpen: () => ipcRenderer.invoke('model-selector:close-if-open'),
   forceRestartOllama: () => ipcRenderer.invoke('force-restart-ollama'),
 
   // Settings Window
@@ -1155,6 +1169,25 @@ contextBridge.exposeInMainWorld("electronAPI", {
     return () => {
       ipcRenderer.removeListener('global-shortcut', subscription)
     }
+  },
+
+  // Stealth keyboard tap bridge
+  stealthTapAvailable: () => ipcRenderer.invoke('stealth-tap:available'),
+  stealthTapPermissionGranted: () => ipcRenderer.invoke('stealth-tap:permission-granted'),
+  stealthTapRequestPermission: () => ipcRenderer.invoke('stealth-tap:request-permission'),
+  stealthTapOpenSettings: () => ipcRenderer.invoke('stealth-tap:open-settings'),
+  stealthTapIsActive: () => ipcRenderer.invoke('stealth-tap:is-active'),
+  stealthTapStop: () => ipcRenderer.invoke('stealth-tap:stop'),
+  stealthTapStart: () => ipcRenderer.invoke('stealth-tap:start'),
+  onStealthTapState: (cb: (state: { active: boolean; reason?: string }) => void) => {
+    const sub = (_: any, state: { active: boolean; reason?: string }) => cb(state)
+    ipcRenderer.on('stealth-tap-state', sub)
+    return () => { ipcRenderer.removeListener('stealth-tap-state', sub) }
+  },
+  onStealthKeyCaptured: (cb: (ev: { keyCode: number; chars: string; flags: number; isKeyDown: boolean }) => void) => {
+    const sub = (_: any, ev: { keyCode: number; chars: string; flags: number; isKeyDown: boolean }) => cb(ev)
+    ipcRenderer.on('stealth-key-captured', sub)
+    return () => { ipcRenderer.removeListener('stealth-key-captured', sub) }
   },
 
   // Donation API
