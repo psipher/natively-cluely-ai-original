@@ -6,7 +6,7 @@ import {
     Camera, RotateCcw, Eye, Layout, MessageSquare, Crop,
     ChevronDown, ChevronUp, Check, BadgeCheck, Power, Palette, Calendar, Ghost, Sun, Moon, RefreshCw, Info, Globe, FlaskConical, Terminal, Settings, Activity, ExternalLink, Trash2,
     Sparkles, Pencil, Briefcase, Building2, Search, MapPin, CheckCircle, HelpCircle, Zap, SlidersHorizontal, PointerOff,
-    Star, AlertCircle, Gift, Smartphone, Cpu
+    Star, AlertCircle, Gift, Smartphone, Cpu, Shield
 } from 'lucide-react';
 import { analytics } from '../lib/analytics/analytics.service';
 import { AboutSection } from './AboutSection';
@@ -27,6 +27,7 @@ import {
     OVERLAY_OPACITY_MIN,
     getDefaultOverlayOpacity,
 } from '../lib/overlayAppearance';
+import { getMeetingInterfaceTheme, setMeetingInterfaceTheme, type MeetingInterfaceTheme } from '../lib/meetingInterfaceTheme';
 import { KeyRecorder } from './ui/KeyRecorder';
 import { ProfileVisualizer, PremiumUpgradeModal } from '../premium';
 import icon from './icon.png';
@@ -374,9 +375,16 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({ isOpen, onClose, init
     const [updateStatus, setUpdateStatus] = useState<'idle' | 'checking' | 'available' | 'uptodate' | 'error'>('idle');
     const themeDropdownRef = React.useRef<HTMLDivElement>(null);
     const aiLangDropdownRef = React.useRef<HTMLDivElement>(null);
+    const [meetingInterfaceTheme, setMeetingInterfaceThemeState] = useState<MeetingInterfaceTheme>(getMeetingInterfaceTheme);
+    const [isInterfaceThemeDropdownOpen, setIsInterfaceThemeDropdownOpen] = useState(false);
+    const interfaceThemeDropdownRef = React.useRef<HTMLDivElement>(null);
 
     
     const [verboseLogging, setVerboseLogging] = useState(false);
+    const [meetingRetention, setMeetingRetention] = useState<'forever' | '7d' | '30d' | 'never'>('forever');
+    const [providerDataScopes, setProviderDataScopes] = useState<{ transcript?: boolean; screenshots?: boolean; reference_files?: boolean; profile_history?: boolean; embeddings?: boolean; post_call_summary?: boolean }>({});
+    const [screenUnderstandingMode, setScreenUnderstandingMode] = useState<'vision_first' | 'vision_only' | 'private_vision'>('vision_first');
+    const [technicalInterviewVisionFirst, setTechnicalInterviewVisionFirst] = useState<boolean>(true);
     const [showVerboseToast, setShowVerboseToast] = useState(false);
     const verboseToastTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -391,8 +399,35 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({ isOpen, onClose, init
             window.electronAPI?.getOverlayMousePassthrough?.().then(setIsMousePassthrough).catch(() => { });
             window.electronAPI?.getDisguise?.().then(setDisguiseMode).catch(() => { });
             window.electronAPI?.getVerboseLogging?.().then(setVerboseLogging).catch(() => { });
+            window.electronAPI?.getMeetingRetention?.().then(setMeetingRetention).catch(() => { });
+            window.electronAPI?.getProviderDataScopes?.().then(setProviderDataScopes).catch(() => { });
+            window.electronAPI?.getScreenUnderstandingMode?.().then(setScreenUnderstandingMode as any).catch(() => { });
+            (window.electronAPI as any)?.getTechnicalInterviewVisionFirst?.()
+                .then(setTechnicalInterviewVisionFirst)
+                .catch(() => {
+                    // Fallback to deprecated alias if the renderer is talking to an older main process.
+                    window.electronAPI?.getTechnicalInterviewDirectVision?.().then(setTechnicalInterviewVisionFirst).catch(() => { });
+                });
         }
     }, [isOpen]);
+
+    useEffect(() => {
+        const api: any = window.electronAPI;
+        if (!api?.onScreenUnderstandingModeChanged) return;
+        const unsubscribe = api.onScreenUnderstandingModeChanged(setScreenUnderstandingMode);
+        return () => unsubscribe?.();
+    }, []);
+
+    useEffect(() => {
+        const api: any = window.electronAPI;
+        const handler = (enabled: boolean) => setTechnicalInterviewVisionFirst(enabled);
+        const unsub1 = api?.onTechnicalInterviewVisionFirstChanged?.(handler);
+        const unsub2 = api?.onTechnicalInterviewDirectVisionChanged?.(handler);
+        return () => {
+            unsub1?.();
+            unsub2?.();
+        };
+    }, []);
 
     useEffect(() => {
         if (!showVerboseToast) return;
@@ -409,6 +444,20 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({ isOpen, onClose, init
             const unsubscribe = window.electronAPI.onUndetectableChanged((newState: boolean) => {
                 setIsUndetectable(newState);
             });
+            return () => unsubscribe();
+        }
+    }, []);
+
+    useEffect(() => {
+        if (window.electronAPI?.onMeetingRetentionChanged) {
+            const unsubscribe = window.electronAPI.onMeetingRetentionChanged(setMeetingRetention);
+            return () => unsubscribe();
+        }
+    }, []);
+
+    useEffect(() => {
+        if (window.electronAPI?.onProviderDataScopesChanged) {
+            const unsubscribe = window.electronAPI.onProviderDataScopesChanged(setProviderDataScopes);
             return () => unsubscribe();
         }
     }, []);
@@ -448,16 +497,19 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({ isOpen, onClose, init
             if (aiLangDropdownRef.current && !aiLangDropdownRef.current.contains(event.target as Node)) {
                 setIsAiLangDropdownOpen(false);
             }
+            if (interfaceThemeDropdownRef.current && !interfaceThemeDropdownRef.current.contains(event.target as Node)) {
+                setIsInterfaceThemeDropdownOpen(false);
+            }
         };
 
-        if (isThemeDropdownOpen || isAiLangDropdownOpen) {
+        if (isThemeDropdownOpen || isAiLangDropdownOpen || isInterfaceThemeDropdownOpen) {
             document.addEventListener('mousedown', handleClickOutside);
         }
 
         return () => {
             document.removeEventListener('mousedown', handleClickOutside);
         };
-    }, [isThemeDropdownOpen, isAiLangDropdownOpen]);
+    }, [isThemeDropdownOpen, isAiLangDropdownOpen, isInterfaceThemeDropdownOpen]);
 
     const [showTranscript, setShowTranscript] = useState(() => {
         const stored = localStorage.getItem('natively_interviewer_transcript');
@@ -764,6 +816,14 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({ isOpen, onClose, init
         const handleStorage = () => {
             const stored = localStorage.getItem('natively_auto_scroll');
             setAutoScroll(stored === 'true');
+        };
+        window.addEventListener('storage', handleStorage);
+        return () => window.removeEventListener('storage', handleStorage);
+    }, []);
+
+    useEffect(() => {
+        const handleStorage = () => {
+            setMeetingInterfaceThemeState(getMeetingInterfaceTheme());
         };
         window.addEventListener('storage', handleStorage);
         return () => window.removeEventListener('storage', handleStorage);
@@ -1475,6 +1535,138 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({ isOpen, onClose, init
                                                     </div>
                                                 </div>
 
+                                                {/* Meeting Retention */}
+                                                <div className="flex items-center justify-between px-4 py-3">
+                                                    <div className="flex items-center gap-4">
+                                                        <div className={`w-10 h-10 bg-bg-item-surface rounded-lg border flex items-center justify-center transition-colors ${meetingRetention === 'never' ? 'border-emerald-500/40 text-emerald-400' : 'border-border-subtle text-text-tertiary'}`}>
+                                                            <Shield size={20} />
+                                                        </div>
+                                                        <div>
+                                                            <h3 className="text-sm font-bold text-text-primary">Do not save meetings</h3>
+                                                            <p className="text-xs text-text-secondary mt-0.5">When enabled, live assistance works but transcripts, summaries, and history are discarded when the meeting ends</p>
+                                                        </div>
+                                                    </div>
+                                                    <div
+                                                        onClick={() => {
+                                                            const nextRetention = meetingRetention === 'never' ? 'forever' : 'never';
+                                                            setMeetingRetention(nextRetention);
+                                                            window.electronAPI?.setMeetingRetention?.(nextRetention);
+                                                        }}
+                                                        className={`w-11 h-6 rounded-full relative transition-colors cursor-pointer ${meetingRetention === 'never' ? 'bg-emerald-500' : 'bg-bg-toggle-switch border border-border-muted'}`}
+                                                        role="switch"
+                                                        aria-checked={meetingRetention === 'never'}
+                                                        aria-label="Do not save meetings"
+                                                    >
+                                                        <div className={`absolute top-1 left-1 w-4 h-4 rounded-full bg-white transition-transform ${meetingRetention === 'never' ? 'translate-x-5' : 'translate-x-0'}`} />
+                                                    </div>
+                                                </div>
+
+                                                {/* Provider Data Scopes — fail-closed cloud share controls */}
+                                                <div className="px-4 py-3 border-t border-border-subtle">
+                                                    <h3 className="text-sm font-bold text-text-primary mb-1">Cloud provider data scopes</h3>
+                                                    <p className="text-xs text-text-secondary mb-3">Disable any data type to block it from being sent to cloud LLM providers. Local providers are unaffected.</p>
+                                                    <div className="flex flex-col gap-2">
+                                                        {([
+                                                            { key: 'transcript', label: 'Transcripts' },
+                                                            { key: 'screenshots', label: 'Screenshots' },
+                                                            { key: 'reference_files', label: 'Reference files' },
+                                                            { key: 'profile_history', label: 'Profile history' },
+                                                            { key: 'embeddings', label: 'Cloud embeddings' },
+                                                            { key: 'post_call_summary', label: 'Post-call summaries' },
+                                                        ] as const).map(({ key, label }) => {
+                                                            const allowed = providerDataScopes[key] !== false;
+                                                            return (
+                                                                <div key={key} className="flex items-center justify-between">
+                                                                    <span className="text-xs text-text-secondary">{label}</span>
+                                                                    <div
+                                                                        onClick={() => {
+                                                                            const next = { ...providerDataScopes, [key]: !allowed };
+                                                                            setProviderDataScopes(next);
+                                                                            window.electronAPI?.setProviderDataScopes?.(next);
+                                                                        }}
+                                                                        className={`w-9 h-5 rounded-full relative transition-colors cursor-pointer ${allowed ? 'bg-emerald-500' : 'bg-bg-toggle-switch border border-border-muted'}`}
+                                                                        role="switch"
+                                                                        aria-checked={allowed}
+                                                                        aria-label={`Allow ${label} to cloud providers`}
+                                                                    >
+                                                                        <div className={`absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white transition-transform ${allowed ? 'translate-x-4' : 'translate-x-0'}`} />
+                                                                    </div>
+                                                                </div>
+                                                            );
+                                                        })}
+                                                    </div>
+                                                </div>
+
+                                                {/* Screen Understanding — vision-first routing */}
+                                                <div className="px-4 py-3 border-t border-border-subtle">
+                                                    <h3 className="text-sm font-bold text-text-primary mb-1">Screen understanding</h3>
+                                                    <p className="text-xs text-text-secondary mb-3">Pick how Natively reads what is on your screen. All paths use the vision-capable AI provider directly; OCR is no longer used.</p>
+                                                    <div className="flex flex-col gap-2">
+                                                        {([
+                                                            {
+                                                                value: 'vision_first' as const,
+                                                                label: 'Vision first',
+                                                                description: 'Recommended. Try every configured vision provider in order; first success wins.',
+                                                            },
+                                                            {
+                                                                value: 'vision_only' as const,
+                                                                label: 'Vision only',
+                                                                description: 'Stricter. Require a vision-capable provider; never silently drop the screenshot.',
+                                                            },
+                                                            {
+                                                                value: 'private_vision' as const,
+                                                                label: 'Private vision (local only)',
+                                                                description: 'Use a local vision model (Ollama) only. Never call cloud vision. Clear error if no local provider is configured.',
+                                                            },
+                                                        ]).map(({ value, label, description }) => {
+                                                            const selected = screenUnderstandingMode === value;
+                                                            return (
+                                                                <div
+                                                                    key={value}
+                                                                    onClick={() => {
+                                                                        setScreenUnderstandingMode(value);
+                                                                        window.electronAPI?.setScreenUnderstandingMode?.(value);
+                                                                    }}
+                                                                    className={`px-3 py-2 rounded-lg border cursor-pointer transition-colors ${selected ? 'border-emerald-500/50 bg-emerald-500/10' : 'border-border-subtle hover:border-border-muted bg-bg-item-surface'}`}
+                                                                    role="radio"
+                                                                    aria-checked={selected}
+                                                                >
+                                                                    <div className="flex items-center justify-between gap-3">
+                                                                        <div className="flex flex-col">
+                                                                            <span className={`text-xs font-semibold ${selected ? 'text-emerald-300' : 'text-text-primary'}`}>{label}</span>
+                                                                            <span className="text-[11px] text-text-secondary leading-snug mt-0.5">{description}</span>
+                                                                        </div>
+                                                                        <div className={`w-4 h-4 rounded-full border-2 shrink-0 ${selected ? 'border-emerald-400 bg-emerald-400' : 'border-border-muted'}`} />
+                                                                    </div>
+                                                                </div>
+                                                            );
+                                                        })}
+                                                    </div>
+                                                    <div className="flex items-center justify-between mt-3 pt-3 border-t border-border-subtle">
+                                                        <div className="flex flex-col">
+                                                            <span className="text-xs text-text-primary font-semibold">Technical interview direct vision</span>
+                                                            <span className="text-[11px] text-text-secondary leading-snug">Use the highest-resolution image profile so code text stays sharp in interview mode.</span>
+                                                        </div>
+                                                        <div
+                                                            onClick={() => {
+                                                                const next = !technicalInterviewVisionFirst;
+                                                                setTechnicalInterviewVisionFirst(next);
+                                                                const api: any = window.electronAPI;
+                                                                if (api?.setTechnicalInterviewVisionFirst) {
+                                                                    api.setTechnicalInterviewVisionFirst(next);
+                                                                } else {
+                                                                    window.electronAPI?.setTechnicalInterviewDirectVision?.(next);
+                                                                }
+                                                            }}
+                                                            className={`w-9 h-5 rounded-full relative transition-colors cursor-pointer ${technicalInterviewVisionFirst ? 'bg-emerald-500' : 'bg-bg-toggle-switch border border-border-muted'}`}
+                                                            role="switch"
+                                                            aria-checked={technicalInterviewVisionFirst}
+                                                        >
+                                                            <div className={`absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white transition-transform ${technicalInterviewVisionFirst ? 'translate-x-4' : 'translate-x-0'}`} />
+                                                        </div>
+                                                    </div>
+                                                </div>
+
                                                 {/* Debug Logging */}
                                                 <div className="flex items-center justify-between px-4 py-3">
                                                     <div className="flex items-center gap-4">
@@ -1632,6 +1824,65 @@ const SettingsOverlay: React.FC<SettingsOverlayProps> = ({ isOpen, onClose, init
                                                                     >
                                                                         <span className={themeMode === option.mode ? 'text-text-primary' : 'text-text-secondary group-hover:text-text-primary'}>{option.icon}</span>
                                                                         <span className="font-medium">{option.label}</span>
+                                                                    </button>
+                                                                ))}
+                                                            </div>
+                                                        )}
+                                                    </div>
+                                                </div>
+
+                                                {/* Meeting Interface Style */}
+                                                <div className="flex items-center justify-between px-4 py-3">
+                                                    <div className="flex items-center gap-4">
+                                                        <div className="w-10 h-10 bg-bg-item-surface rounded-lg border border-border-subtle flex items-center justify-center text-text-tertiary">
+                                                            <Layout size={20} />
+                                                        </div>
+                                                        <div>
+                                                            <h3 className="text-sm font-bold text-text-primary">Meeting Interface Style</h3>
+                                                            <p className="text-xs text-text-secondary mt-0.5">
+                                                                {meetingInterfaceTheme === 'liquid-glass'
+                                                                    ? 'Liquid glass — Apple-inspired transparent overlay'
+                                                                    : 'Default overlay appearance'}
+                                                            </p>
+                                                        </div>
+                                                    </div>
+
+                                                    <div className="relative" ref={interfaceThemeDropdownRef}>
+                                                        <button
+                                                            onClick={() => setIsInterfaceThemeDropdownOpen(!isInterfaceThemeDropdownOpen)}
+                                                            className="bg-bg-component hover:bg-bg-elevated border border-border-subtle text-text-primary px-3 py-1.5 rounded-lg text-xs font-medium transition-colors flex items-center gap-2 min-w-[130px] justify-between"
+                                                        >
+                                                            <div className="flex items-center gap-2 overflow-hidden">
+                                                                <span className="text-text-secondary shrink-0">
+                                                                    {meetingInterfaceTheme === 'liquid-glass' ? <Sparkles size={14} /> : <Layout size={14} />}
+                                                                </span>
+                                                                <span className="text-ellipsis overflow-hidden whitespace-nowrap">
+                                                                    {meetingInterfaceTheme === 'liquid-glass' ? 'Liquid Glass' : 'Default'}
+                                                                </span>
+                                                            </div>
+                                                            <ChevronDown size={12} className={`shrink-0 transition-transform ${isInterfaceThemeDropdownOpen ? 'rotate-180' : ''}`} />
+                                                        </button>
+
+                                                        {isInterfaceThemeDropdownOpen && (
+                                                            <div className="absolute right-0 top-full mt-1 min-w-full w-max bg-bg-elevated border border-border-subtle rounded-lg shadow-xl overflow-hidden z-20 p-1 animated fadeIn select-none">
+                                                                {([
+                                                                    { mode: 'default' as MeetingInterfaceTheme, label: 'Default', icon: <Layout size={14} />, desc: 'Classic overlay' },
+                                                                    { mode: 'liquid-glass' as MeetingInterfaceTheme, label: 'Liquid Glass', icon: <Sparkles size={14} />, desc: 'Apple-inspired glass' },
+                                                                ] as const).map((option) => (
+                                                                    <button
+                                                                        key={option.mode}
+                                                                        onClick={() => {
+                                                                            setMeetingInterfaceTheme(option.mode);
+                                                                            setMeetingInterfaceThemeState(option.mode);
+                                                                            setIsInterfaceThemeDropdownOpen(false);
+                                                                        }}
+                                                                        className={`w-full text-left px-2 py-1.5 rounded-md text-xs flex items-center gap-2 transition-colors ${meetingInterfaceTheme === option.mode ? 'text-text-primary bg-bg-item-active/50' : 'text-text-secondary hover:bg-bg-input hover:text-text-primary'}`}
+                                                                    >
+                                                                        <span className={meetingInterfaceTheme === option.mode ? 'text-text-primary' : 'text-text-secondary'}>{option.icon}</span>
+                                                                        <div>
+                                                                            <span className="font-medium">{option.label}</span>
+                                                                            <span className="text-text-tertiary ml-1.5">{option.desc}</span>
+                                                                        </div>
                                                                     </button>
                                                                 ))}
                                                             </div>

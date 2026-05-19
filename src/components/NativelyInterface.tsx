@@ -27,7 +27,9 @@ import {
     Code,
     Copy,
     Check,
-    PointerOff
+    PointerOff,
+    ShieldCheck,
+    Monitor
 } from 'lucide-react';
 import { motion, AnimatePresence, useMotionValue, useTransform, animate } from 'framer-motion';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
@@ -52,8 +54,12 @@ const REHYPE_PLUGINS = [rehypeKatex];
 import { analytics, detectProviderType } from '../lib/analytics/analytics.service';
 import { useShortcuts } from '../hooks/useShortcuts';
 import { useResolvedTheme } from '../hooks/useResolvedTheme';
-import { getOverlayAppearance, OVERLAY_OPACITY_DEFAULT } from '../lib/overlayAppearance';
+import { getOverlayAppearance, OVERLAY_OPACITY_DEFAULT, getGlassOverlayAppearance } from '../lib/overlayAppearance';
+import type { MeetingInterfaceTheme } from '../lib/meetingInterfaceTheme';
+import GlassEffectLayer from './ui/GlassEffectLayer';
 import { getCodexCliModelDisplayName } from '../utils/modelUtils';
+import { DynamicActionBar } from './dynamic-actions/DynamicActionBar';
+import type { DynamicActionPayload } from '../types/electron';
 
 interface Message {
     id: string;
@@ -79,6 +85,7 @@ interface Message {
 interface NativelyInterfaceProps {
     onEndMeeting?: () => void;
     overlayOpacity?: number;
+    interfaceTheme?: MeetingInterfaceTheme;
 }
 
 // PERF: HighlightedCode renders a single fenced code block. Hoisted to module
@@ -168,6 +175,40 @@ interface MessageRowProps {
     onCopy: (text: string) => void;
     renderMessageText: (msg: Message) => React.ReactNode;
 }
+const formatProviderLabel = (provider?: string | null): string => {
+    if (!provider) return 'not set';
+    return provider
+        .split(/[-_\s]+/)
+        .filter(Boolean)
+        .map(part => part.charAt(0).toUpperCase() + part.slice(1))
+        .join(' ');
+};
+
+const getSttSummary = (
+    userStatus: 'connected' | 'reconnecting' | 'failed',
+    interviewerStatus: 'connected' | 'reconnecting' | 'failed',
+    userProvider: string,
+    interviewerProvider: string,
+    notConfigured: boolean
+): { label: string; tone: 'ok' | 'warn' | 'error'; detail: string } => {
+    if (notConfigured) {
+        return { label: 'STT not configured', tone: 'error', detail: 'Open Audio settings to select a provider' };
+    }
+    if (userStatus === 'failed' || interviewerStatus === 'failed') {
+        return { label: 'STT needs attention', tone: 'error', detail: `${formatProviderLabel(userProvider)} mic · ${formatProviderLabel(interviewerProvider)} system` };
+    }
+    if (userStatus === 'reconnecting' || interviewerStatus === 'reconnecting') {
+        return { label: 'STT reconnecting', tone: 'warn', detail: `${formatProviderLabel(userProvider)} mic · ${formatProviderLabel(interviewerProvider)} system` };
+    }
+    return { label: 'STT healthy', tone: 'ok', detail: `${formatProviderLabel(userProvider)} mic · ${formatProviderLabel(interviewerProvider)} system` };
+};
+
+const getStatusToneClass = (tone: 'ok' | 'warn' | 'error'): string => {
+    if (tone === 'error') return 'text-rose-600 dark:text-rose-300 border-rose-500/20 bg-rose-500/10';
+    if (tone === 'warn') return 'text-amber-600 dark:text-amber-300 border-amber-500/20 bg-amber-500/10';
+    return 'text-emerald-600 dark:text-emerald-300 border-emerald-500/20 bg-emerald-500/10';
+};
+
 const MessageRow = React.memo(function MessageRow({
     msg, isLightTheme, appearance, onCopy, renderMessageText,
 }: MessageRowProps) {
@@ -234,8 +275,14 @@ const MessageRow = React.memo(function MessageRow({
     prev.onCopy === next.onCopy
 );
 
-const NativelyInterface: React.FC<NativelyInterfaceProps> = ({ onEndMeeting, overlayOpacity = OVERLAY_OPACITY_DEFAULT }) => {
+const NativelyInterface: React.FC<NativelyInterfaceProps> = ({
+    onEndMeeting,
+    overlayOpacity = OVERLAY_OPACITY_DEFAULT,
+    interfaceTheme = 'default',
+}) => {
     const isLightTheme = useResolvedTheme() === 'light';
+    const isGlassTheme = interfaceTheme === 'liquid-glass';
+    const shellRef = React.useRef<HTMLDivElement>(null);
     const [isExpanded, setIsExpanded] = useState(true);
     const [inputValue, setInputValue] = useState('');
     const { shortcuts, isShortcutPressed } = useShortcuts();
@@ -275,6 +322,7 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({ onEndMeeting, ove
         window.addEventListener('storage', handleStorage);
         return () => window.removeEventListener('storage', handleStorage);
     }, []);
+
 
     // Sync auto-scroll setting
     useEffect(() => {
@@ -364,6 +412,14 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({ onEndMeeting, ove
 
     // Active mode name (shown as a badge near the Modes button)
     const [activeModeLabel, setActiveModeLabel] = useState<string | null>(null);
+    const [llmProviderLabel, setLlmProviderLabel] = useState<string>('unknown');
+    const [llmPrivacyLabel, setLlmPrivacyLabel] = useState<string>('Checking privacy route');
+    const [screenContextStatus, setScreenContextStatus] = useState<'not_available' | 'available' | 'failed'>('not_available');
+    const [latestUsedImageInput, setLatestUsedImageInput] = useState(false);
+    // Vision-first provenance — populated from the generateWhatToSay response.
+    const [latestVisionProviderUsed, setLatestVisionProviderUsed] = useState<string | undefined>(undefined);
+    const [latestVisionModelUsed, setLatestVisionModelUsed] = useState<string | undefined>(undefined);
+    const [latestVisionFailureReason, setLatestVisionFailureReason] = useState<string | undefined>(undefined);
 
     useEffect(() => {
         // Load initial active mode name
@@ -375,6 +431,26 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({ onEndMeeting, ove
             setActiveModeLabel(data.name);
         });
         return () => unsub?.();
+    }, []);
+
+    useEffect(() => {
+        let mounted = true;
+        const loadLlmRoute = async () => {
+            const config = await window.electronAPI?.getCurrentLlmConfig?.().catch(() => null);
+            if (!mounted || !config) return;
+            setLlmProviderLabel(formatProviderLabel(config.provider));
+            setLlmPrivacyLabel(config.provider === 'ollama' || config.provider === 'codex-cli'
+                ? 'Local/private route'
+                : config.provider === 'custom'
+                    ? 'Custom endpoint route'
+                    : 'Cloud LLM route');
+        };
+        loadLlmRoute();
+        const unsub = window.electronAPI?.onModelChanged?.(() => { loadLlmRoute(); });
+        return () => {
+            mounted = false;
+            unsub?.();
+        };
     }, []);
 
     // Model Selection State
@@ -399,8 +475,10 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({ onEndMeeting, ove
     const codeTheme = isLightTheme ? oneLight : vscDarkPlus;
     const codeLineNumberColor = isLightTheme ? 'rgba(15,23,42,0.35)' : 'rgba(255,255,255,0.2)';
     const appearance = useMemo(
-        () => getOverlayAppearance(overlayOpacity, isLightTheme ? 'light' : 'dark'),
-        [overlayOpacity, isLightTheme]
+        () => isGlassTheme
+            ? getGlassOverlayAppearance()
+            : getOverlayAppearance(overlayOpacity, isLightTheme ? 'light' : 'dark'),
+        [overlayOpacity, isLightTheme, isGlassTheme]
     );
     const overlayPanelClass = 'overlay-text-primary';
     const subtleSurfaceClass = 'overlay-subtle-surface';
@@ -1423,7 +1501,8 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({ onEndMeeting, ove
         // Optional: Trigger a small toast or state change for visual feedback
     }, []);
 
-    const handleWhatToSay = async () => {
+    const handleWhatToSay = async (promptInstruction?: string | React.MouseEvent) => {
+        const dynamicPromptInstruction = typeof promptInstruction === 'string' ? promptInstruction : undefined;
         setIsExpanded(true);
         setIsProcessing(true);
         analytics.trackCommandExecuted('what_to_say');
@@ -1455,7 +1534,16 @@ const NativelyInterface: React.FC<NativelyInterfaceProps> = ({ onEndMeeting, ove
 
         try {
             // Pass imagePath if attached
-            await window.electronAPI.generateWhatToSay(undefined, currentAttachments.length > 0 ? currentAttachments.map(s => s.path) : undefined);
+            const result = await window.electronAPI.generateWhatToSay(
+                undefined,
+                currentAttachments.length > 0 ? currentAttachments.map(s => s.path) : undefined,
+                dynamicPromptInstruction ? { promptInstruction: dynamicPromptInstruction } : undefined
+            );
+            setScreenContextStatus(result.screenContextStatus || 'not_available');
+            setLatestUsedImageInput(Boolean(result.usedImageInput));
+            setLatestVisionProviderUsed(result.visionProviderUsed);
+            setLatestVisionModelUsed(result.visionModelUsed);
+            setLatestVisionFailureReason(result.visionFailureReason);
         } catch (err) {
             setMessages(prev => [...prev, {
                 id: Date.now().toString(),
@@ -1899,6 +1987,24 @@ Provide only the answer, nothing else.`;
         // Clear inputs immediately
         setInputValue('');
         setAttachedContext([]);
+
+        // Seal any in-flight streaming rows from a previous turn before we
+        // append the new user message + placeholder. Without this, the rAF
+        // token coalescer (queueToken) can append tokens of the next stream
+        // onto the prior row whenever the streaming intent matches —
+        // surfacing as the next answer starting mid-sentence with leftover
+        // text from the previous turn. Also flush any tokens still pending
+        // in the rAF buffer so they land on the prior row, not the new one.
+        flushToken();
+        tokenBufRef.current.intent = '';
+        tokenBufRef.current.text = '';
+        if (tokenBufRef.current.raf !== null) {
+            cancelAnimationFrame(tokenBufRef.current.raf);
+            tokenBufRef.current.raf = null;
+        }
+        setMessages(prev => prev.some(m => m.isStreaming)
+            ? prev.map(m => m.isStreaming ? { ...m, isStreaming: false } : m)
+            : prev);
 
         setMessages(prev => [...prev, {
             id: Date.now().toString(),
@@ -2919,6 +3025,8 @@ Provide only the answer, nothing else.`;
     const interviewerSttIndicatorStatus = sttInterviewerStatus;
     // Strip consecutive error count from display — show only in expanded diagnostics
     const interviewerSttIndicatorError = sttInterviewerError?.replace(/\s*\(\d+ consecutive errors\):?/gi, '');
+    const sttSummary = getSttSummary(sttUserStatus, sttInterviewerStatus, sttUserProvider, sttInterviewerProvider, sttNotConfigured);
+    const statusPillBaseClass = `flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[10px] font-medium shadow-sm backdrop-blur-xl ${isLightTheme ? 'bg-white/55 border-black/10' : 'bg-black/20 border-white/10'}`;
 
     const copyDiagnostics = async () => {
         const version = import.meta.env.VITE_APP_VERSION || 'unknown';
@@ -2958,7 +3066,7 @@ Provide only the answer, nothing else.`;
     };
 
     return (
-        <div ref={contentRef} className="flex flex-col items-center w-fit mx-auto h-fit min-h-0 bg-transparent p-0 rounded-[24px] font-sans gap-2 overlay-text-primary">
+        <div ref={contentRef} data-interface-theme={isGlassTheme ? 'liquid-glass' : undefined} className="flex flex-col items-center w-fit mx-auto h-fit min-h-0 bg-transparent p-0 rounded-[24px] font-sans gap-2 overlay-text-primary">
 
             <AnimatePresence>
                 {isExpanded && (
@@ -2977,11 +3085,73 @@ Provide only the answer, nothing else.`;
                             onLogoClick={() => window.electronAPI?.setWindowMode?.('launcher')}
                         />
                         <motion.div
+                            ref={shellRef}
                             className={`relative max-w-full backdrop-blur-2xl border rounded-[24px] overflow-hidden flex flex-col draggable-area overlay-shell-surface ${overlayPanelClass}`}
-                            style={{ ...appearance.shellStyle, width: shellWidth, willChange: 'width' }}
+                            style={{
+                                ...appearance.shellStyle,
+                                width: shellWidth,
+                                // Removed will-change: 'width' — Framer Motion animates shellWidth
+                                // using transform (translateX), not CSS width, so this hint created
+                                // a ghost compositor layer with stale dimensions from the first
+                                // meeting's layout, blocking correct compositing on remount.
+                            }}
                         >
+                            {isGlassTheme && <GlassEffectLayer parentRef={shellRef} cornerRadius={24} />}
 
-
+                            <div className="relative no-drag flex flex-wrap items-center justify-center gap-1.5 px-4 pt-3 pb-1">
+                                <div className={`${statusPillBaseClass} overlay-text-primary`} title={activeModeLabel ? `Active mode: ${activeModeLabel}` : 'No active mode selected'}>
+                                    <LayoutGrid className="h-3 w-3 opacity-70" />
+                                    <span>{activeModeLabel ? `Mode: ${activeModeLabel}` : 'General mode'}</span>
+                                </div>
+                                <div className={`${statusPillBaseClass} ${getStatusToneClass(sttSummary.tone)}`} title={sttSummary.detail}>
+                                    <Mic className="h-3 w-3 opacity-70" />
+                                    <span>{sttSummary.label}</span>
+                                </div>
+                                {(() => {
+                                    // Vision-first status chip. Order of preference for what to show:
+                                    //   1. attached screenshots queued for this turn
+                                    //   2. failure from the last vision call (reason-aware)
+                                    //   3. success from the last vision call (provider/model surfaced)
+                                    //   4. legacy ocr-available fallback (only fires if a legacy mode is re-enabled)
+                                    //   5. nothing-yet placeholder
+                                    const visionFailed = screenContextStatus === 'failed' || !!latestVisionFailureReason;
+                                    const visionSucceeded = (latestUsedImageInput || screenContextStatus === 'available') && !visionFailed;
+                                    const failureLabelMap: Record<string, string> = {
+                                        no_vision_provider: 'No vision provider',
+                                        all_vision_failed: 'Vision failed',
+                                        privacy_blocked: 'Private mode blocked vision',
+                                        scope_blocked: 'Screenshots disabled',
+                                        provider_timeout: 'Vision timed out',
+                                    };
+                                    const failureLabel = latestVisionFailureReason ? (failureLabelMap[latestVisionFailureReason] || 'Vision failed') : 'Vision failed';
+                                    const failureTitleMap: Record<string, string> = {
+                                        no_vision_provider: 'No vision-capable provider is configured. Add a Natively, OpenAI, Claude, Gemini, or Groq key — or configure a local Ollama vision model.',
+                                        all_vision_failed: 'All configured vision providers failed for this turn. Check provider quotas and try again.',
+                                        privacy_blocked: 'Private vision mode blocked cloud vision providers; no local vision provider is configured.',
+                                        scope_blocked: 'Screenshots are disabled for the current provider. Enable the screenshots scope in Settings.',
+                                        provider_timeout: 'Vision provider exceeded its per-call timeout; the chain moved on to the next provider.',
+                                    };
+                                    const failureTitle = latestVisionFailureReason ? (failureTitleMap[latestVisionFailureReason] || 'The vision provider failed for this turn.') : 'Screen vision did not return a result for this turn.';
+                                    const providerLabel = latestVisionProviderUsed
+                                        ? `Vision: ${latestVisionProviderUsed}`
+                                        : 'Vision input used';
+                                    const providerTitle = latestVisionProviderUsed && latestVisionModelUsed
+                                        ? `Latest answer used ${latestVisionProviderUsed} (${latestVisionModelUsed}) vision on the screenshot`
+                                        : latestVisionProviderUsed
+                                            ? `Latest answer used ${latestVisionProviderUsed} vision on the screenshot`
+                                            : 'The latest answer received direct image input from the attached screen';
+                                    return (
+                                        <div className={`${statusPillBaseClass} ${visionFailed ? getStatusToneClass('warn') : visionSucceeded ? getStatusToneClass('ok') : 'overlay-text-primary'}`} title={attachedContext.length > 0 ? 'Attached screenshots will be sent to the vision provider when you send this turn' : visionFailed ? failureTitle : visionSucceeded ? providerTitle : 'No screen context attached'}>
+                                            <Monitor className="h-3 w-3 opacity-70" />
+                                            <span>{attachedContext.length > 0 ? `${attachedContext.length} screen attached` : visionFailed ? failureLabel : visionSucceeded ? providerLabel : 'No screen context'}</span>
+                                        </div>
+                                    );
+                                })()}
+                                <div className={`${statusPillBaseClass} overlay-text-primary`} title={`${llmPrivacyLabel}: ${llmProviderLabel}`}>
+                                    <ShieldCheck className="h-3 w-3 opacity-70" />
+                                    <span>{llmPrivacyLabel}</span>
+                                </div>
+                            </div>
 
                             {/* System Audio Permission Warning Banner */}
                             {systemAudioWarning && (
@@ -3051,6 +3221,16 @@ Provide only the answer, nothing else.`;
                                 </div>
                             )}
 
+                            {/* Phase 3 — Dynamic action card row (Cluely-style live triggers).
+                                Appears between status pills and rolling transcript so users see
+                                actionable suggestions in their primary scan path. Bar self-hides
+                                when no actions are present. */}
+                            <DynamicActionBar
+                                onAcceptAction={(action: DynamicActionPayload) => {
+                                    void handleWhatToSay(action.promptInstruction);
+                                }}
+                            />
+
                             {/* Rolling Transcript Bar — includes STT status indicator inline */}
                             {(showTranscript && rollingTranscript) || interviewerSttIndicatorStatus !== 'connected' || sttUserStatus !== 'connected' ? (
                                 <RollingTranscript
@@ -3112,7 +3292,7 @@ Provide only the answer, nothing else.`;
                                                     </span>
                                                 </div>
                                             )}
-                                            <div className="px-3 py-2 flex gap-1.5 items-center">
+                                            <div className="px-3 py-2 flex gap-1.5 items-center bg-emerald-500/10 border border-emerald-500/20 rounded-full">
                                                 <div className="w-2 h-2 bg-emerald-400 rounded-full animate-bounce" style={{ animationDelay: '0ms' }} />
                                                 <div className="w-2 h-2 bg-emerald-400 rounded-full animate-bounce" style={{ animationDelay: '150ms' }} />
                                                 <div className="w-2 h-2 bg-emerald-400 rounded-full animate-bounce" style={{ animationDelay: '300ms' }} />
@@ -3123,7 +3303,7 @@ Provide only the answer, nothing else.`;
 
                                     {isProcessing && (
                                         <div className="flex justify-start">
-                                            <div className="px-3 py-2 flex gap-1.5">
+                                            <div className="px-3 py-2 flex gap-1.5 overlay-subtle-surface rounded-full border" style={appearance.subtleStyle}>
                                                 <div className="w-2 h-2 bg-slate-400 rounded-full animate-bounce" style={{ animationDelay: '0ms' }} />
                                                 <div className="w-2 h-2 bg-slate-400 rounded-full animate-bounce" style={{ animationDelay: '150ms' }} />
                                                 <div className="w-2 h-2 bg-slate-400 rounded-full animate-bounce" style={{ animationDelay: '300ms' }} />
@@ -3155,7 +3335,7 @@ Provide only the answer, nothing else.`;
                                     onClick={handleAnswerNow}
                                     className={`flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-full text-[11px] font-medium transition-all active:scale-95 duration-200 interaction-base interaction-press min-w-[74px] whitespace-nowrap shrink-0 ${isManualRecording
                                         ? 'bg-red-500/10 text-red-400 ring-1 ring-red-500/20'
-                                        : 'overlay-chip-surface overlay-text-interactive hover:text-emerald-500 hover:bg-emerald-500/10'
+                                        : 'overlay-chip-surface overlay-text-interactive'
                                         }`}
                                     style={isManualRecording ? undefined : appearance.chipStyle}
                                 >
