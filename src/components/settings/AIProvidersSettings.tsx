@@ -4,11 +4,16 @@ import { CODEX_CLI_MODEL, CODEX_CLI_MODEL_PRESETS, codexCliSelectorId, STANDARD_
 import { validateCurl } from '../../lib/curl-validator';
 import { ProviderCard } from './ProviderCard';
 
+const CODEX_SERVICE_TIERS = ['default', 'fast', 'flex'] as const;
+const CODEX_MODEL_REASONING_EFFORTS = ['low', 'medium', 'high', 'xhigh'] as const;
+
 interface CustomProvider {
     id: string;
     name: string;
     curlCommand: string;
     responsePath: string;
+    /** Whether this provider accepts screenshots. undefined = auto-detect from the cURL template. */
+    multimodal?: boolean;
 }
 
 interface ModelOption {
@@ -21,9 +26,10 @@ interface ModelSelectProps {
     options: ModelOption[];
     onChange: (value: string) => void;
     placeholder?: string;
+    className?: string;
 }
 
-const ModelSelect: React.FC<ModelSelectProps> = ({ value, options, onChange, placeholder = "Select model" }) => {
+const ModelSelect: React.FC<ModelSelectProps> = ({ value, options, onChange, placeholder = "Select model", className = "" }) => {
     const [isOpen, setIsOpen] = useState(false);
     const containerRef = React.useRef<HTMLDivElement>(null);
 
@@ -39,11 +45,13 @@ const ModelSelect: React.FC<ModelSelectProps> = ({ value, options, onChange, pla
 
     const selectedOption = options.find(o => o.id === value);
 
+    const paddingClass = className.includes('py-') ? '' : 'py-1.5';
+
     return (
         <div className="relative" ref={containerRef}>
             <button
                 onClick={() => setIsOpen(!isOpen)}
-                className="w-40 bg-bg-input border border-border-subtle rounded-lg px-3 py-1.5 text-xs text-text-primary focus:outline-none focus:border-accent-primary flex items-center justify-between hover:bg-bg-elevated transition-colors"
+                className={`w-40 bg-bg-input border border-border-subtle rounded-lg px-3 ${paddingClass} ${className} text-xs text-text-primary focus:outline-none focus:border-accent-primary flex items-center justify-between hover:bg-bg-elevated transition-colors`}
                 type="button"
             >
                 <span className="truncate pr-2">{selectedOption ? selectedOption.name : placeholder}</span>
@@ -105,6 +113,7 @@ const CodexCliModelField: React.FC<{
                     onSelect(modelId);
                 }}
                 placeholder="Preset"
+                className="py-2"
             />
         </div>
     </label>
@@ -116,6 +125,7 @@ export const AIProvidersSettings: React.FC = () => {
     const [groqApiKey, setGroqApiKey] = useState('');
     const [openaiApiKey, setOpenaiApiKey] = useState('');
     const [claudeApiKey, setClaudeApiKey] = useState('');
+    const [deepseekApiKey, setDeepseekApiKey] = useState('');
 
     // Status
     const [savedStatus, setSavedStatus] = useState<Record<string, boolean>>({});
@@ -131,6 +141,8 @@ export const AIProvidersSettings: React.FC = () => {
     const [customName, setCustomName] = useState('');
     const [customCurl, setCustomCurl] = useState('');
     const [customResponsePath, setCustomResponsePath] = useState('');
+    // 'auto' = detect vision support from the template; 'on'/'off' = explicit override.
+    const [customVision, setCustomVision] = useState<'auto' | 'on' | 'off'>('auto');
     const [curlError, setCurlError] = useState<string | null>(null);
 
     // --- Local (Ollama) ---
@@ -140,18 +152,25 @@ export const AIProvidersSettings: React.FC = () => {
     const [isRefreshingOllama, setIsRefreshingOllama] = useState(false);
 
     // --- Local (Codex CLI) ---
-    const [codexCliConfig, setCodexCliConfig] = useState({ enabled: false, path: 'codex', model: 'gpt-5.4', fastModel: 'gpt-5.3-codex-spark', timeoutMs: 60000 });
+    const [codexCliConfig, setCodexCliConfig] = useState({ enabled: false, path: 'codex', model: 'gpt-5.4', fastModel: 'gpt-5.3-codex-spark', timeoutMs: 60000, sandboxMode: 'read-only' as string, serviceTier: 'default', modelReasoningEffort: undefined as string | undefined });
     const [codexCliStatus, setCodexCliStatus] = useState<'idle' | 'testing' | 'success' | 'error'>('idle');
     const [codexCliError, setCodexCliError] = useState('');
 
     // --- Default Model ---
-    const [defaultModel, setDefaultModel] = useState<string>('gemini-3.1-flash-lite-preview');
+    const [defaultModel, setDefaultModel] = useState<string>('gemini-3.5-flash');
     const [fastResponseMode, setFastResponseMode] = useState(false);
     const [credentialsLoaded, setCredentialsLoaded] = useState(false);
     const canUseFastMode = !!(hasStoredKey.groq || hasStoredKey.natively || codexCliConfig.enabled);
 
     // --- Dynamic Model Discovery ---
     const [preferredModels, setPreferredModels] = useState<Record<string, string>>({});
+
+    // --- Screen Understanding (vision routing) ---
+    const [screenUnderstandingMode, setScreenUnderstandingMode] = useState<'vision_first' | 'vision_only' | 'private_vision'>('vision_first');
+    const [technicalInterviewVisionFirst, setTechnicalInterviewVisionFirst] = useState<boolean>(true);
+
+    // --- Cloud Provider Data Scopes (fail-closed cloud share controls) ---
+    const [providerDataScopes, setProviderDataScopes] = useState<{ transcript?: boolean; screenshots?: boolean; reference_files?: boolean; profile_history?: boolean; embeddings?: boolean; post_call_summary?: boolean }>({});
 
     // Load Initial Data
     useEffect(() => {
@@ -169,6 +188,7 @@ export const AIProvidersSettings: React.FC = () => {
                         groq: creds.hasGroqKey,
                         openai: creds.hasOpenaiKey,
                         claude: creds.hasClaudeKey,
+                        deepseek: creds.hasDeepseekKey || false,
                         natively: creds.hasNativelyKey || false
                     });
                     // Load preferred models
@@ -177,6 +197,7 @@ export const AIProvidersSettings: React.FC = () => {
                     if (creds.groqPreferredModel) pm.groq = creds.groqPreferredModel;
                     if (creds.openaiPreferredModel) pm.openai = creds.openaiPreferredModel;
                     if (creds.claudePreferredModel) pm.claude = creds.claudePreferredModel;
+                    if (creds.deepseekPreferredModel) pm.deepseek = creds.deepseekPreferredModel;
                     setPreferredModels(pm);
                 }
 
@@ -184,7 +205,7 @@ export const AIProvidersSettings: React.FC = () => {
                 // canUseFastMode will be correct when the enforcement effect runs.
                 // @ts-ignore
                 const cliConfig = await window.electronAPI?.getCodexCliConfig?.();
-                if (cliConfig) setCodexCliConfig(cliConfig);
+                if (cliConfig) setCodexCliConfig(cliConfig as typeof codexCliConfig);
 
                 const fastMode = await window.electronAPI?.getGroqFastTextMode();
                 if (fastMode) setFastResponseMode(fastMode.enabled);
@@ -251,6 +272,47 @@ export const AIProvidersSettings: React.FC = () => {
         return () => clearInterval(interval);
     }, []);
 
+    // Load Screen Understanding (vision routing) settings
+    useEffect(() => {
+        window.electronAPI?.getScreenUnderstandingMode?.().then(setScreenUnderstandingMode as any).catch(() => { });
+        (window.electronAPI as any)?.getTechnicalInterviewVisionFirst?.()
+            .then(setTechnicalInterviewVisionFirst)
+            .catch(() => {
+                // Fallback to deprecated alias if the renderer is talking to an older main process.
+                window.electronAPI?.getTechnicalInterviewDirectVision?.().then(setTechnicalInterviewVisionFirst).catch(() => { });
+            });
+    }, []);
+
+    useEffect(() => {
+        const api: any = window.electronAPI;
+        if (!api?.onScreenUnderstandingModeChanged) return;
+        const unsubscribe = api.onScreenUnderstandingModeChanged(setScreenUnderstandingMode);
+        return () => unsubscribe?.();
+    }, []);
+
+    useEffect(() => {
+        const api: any = window.electronAPI;
+        const handler = (enabled: boolean) => setTechnicalInterviewVisionFirst(enabled);
+        const unsub1 = api?.onTechnicalInterviewVisionFirstChanged?.(handler);
+        const unsub2 = api?.onTechnicalInterviewDirectVisionChanged?.(handler);
+        return () => {
+            unsub1?.();
+            unsub2?.();
+        };
+    }, []);
+
+    // Load Cloud Provider Data Scopes and subscribe to cross-window changes
+    useEffect(() => {
+        window.electronAPI?.getProviderDataScopes?.().then(setProviderDataScopes).catch(() => { });
+    }, []);
+
+    useEffect(() => {
+        if (window.electronAPI?.onProviderDataScopesChanged) {
+            const unsubscribe = window.electronAPI.onProviderDataScopesChanged(setProviderDataScopes);
+            return () => unsubscribe();
+        }
+    }, []);
+
     const ensureOllamaStartup = async () => {
         setOllamaStatus('checking');
         try {
@@ -315,7 +377,7 @@ export const AIProvidersSettings: React.FC = () => {
         const normalized = { ...next, timeoutMs: Number(next.timeoutMs) || 60000 };
         setCodexCliConfig(normalized);
         const result = await window.electronAPI?.setCodexCliConfig?.(normalized);
-        if (result?.config) setCodexCliConfig(result.config);
+        if (result?.config) setCodexCliConfig(result.config as typeof codexCliConfig);
         return result;
     };
 
@@ -329,7 +391,7 @@ export const AIProvidersSettings: React.FC = () => {
             if (result?.success) {
                 // If the main process auto-detected an install, reflect the
                 // resolved path in the form so the user sees what got picked.
-                if (result.config) setCodexCliConfig(result.config);
+                if (result.config) setCodexCliConfig(result.config as typeof codexCliConfig);
                 setCodexCliStatus('success');
                 setTimeout(() => setCodexCliStatus('idle'), 3000);
             } else {
@@ -355,6 +417,8 @@ export const AIProvidersSettings: React.FC = () => {
             if (provider === 'openai') result = await window.electronAPI.setOpenaiApiKey(key);
             // @ts-ignore
             if (provider === 'claude') result = await window.electronAPI.setClaudeApiKey(key);
+            // @ts-ignore
+            if (provider === 'deepseek') result = await window.electronAPI.setDeepseekApiKey(key);
 
             if (result && result.success) {
                 setSavedStatus(prev => ({ ...prev, [provider]: true }));
@@ -381,6 +445,8 @@ export const AIProvidersSettings: React.FC = () => {
             if (provider === 'openai') result = await window.electronAPI.setOpenaiApiKey('');
             // @ts-ignore
             if (provider === 'claude') result = await window.electronAPI.setClaudeApiKey('');
+            // @ts-ignore
+            if (provider === 'deepseek') result = await window.electronAPI.setDeepseekApiKey('');
 
             if (result && result.success) {
                 setHasStoredKey(prev => ({ ...prev, [provider]: false }));
@@ -434,6 +500,7 @@ export const AIProvidersSettings: React.FC = () => {
         setCustomName(provider.name);
         setCustomCurl(provider.curlCommand);
         setCustomResponsePath(provider.responsePath || '');
+        setCustomVision(provider.multimodal === true ? 'on' : provider.multimodal === false ? 'off' : 'auto');
         setIsEditingCustom(true);
         setCurlError(null);
     };
@@ -443,6 +510,7 @@ export const AIProvidersSettings: React.FC = () => {
         setCustomName('');
         setCustomCurl('');
         setCustomResponsePath('');
+        setCustomVision('auto');
         setIsEditingCustom(true);
         setCurlError(null);
     };
@@ -464,7 +532,9 @@ export const AIProvidersSettings: React.FC = () => {
             id: editingProvider ? editingProvider.id : crypto.randomUUID(),
             name: customName,
             curlCommand: customCurl,
-            responsePath: customResponsePath
+            responsePath: customResponsePath,
+            // 'auto' → omit the flag so the backend auto-detects from the template.
+            ...(customVision === 'on' ? { multimodal: true } : customVision === 'off' ? { multimodal: false } : {}),
         };
 
         try {
@@ -678,6 +748,26 @@ export const AIProvidersSettings: React.FC = () => {
                         onPreferredModelChange={(model) => setPreferredModels(prev => ({ ...prev, claude: model }))}
                     />
 
+                    {/* DeepSeek — text-only; intentionally not part of the screenshot/vision fallback chain. */}
+                    <ProviderCard
+                        providerId="deepseek"
+                        providerName="DeepSeek"
+                        apiKey={deepseekApiKey}
+                        preferredModel={preferredModels.deepseek}
+                        hasStoredKey={!!hasStoredKey.deepseek}
+                        onKeyChange={setDeepseekApiKey}
+                        onSaveKey={async () => { await handleSaveKey('deepseek', deepseekApiKey, setDeepseekApiKey); }}
+                        onRemoveKey={() => handleRemoveKey('deepseek', setDeepseekApiKey)}
+                        onTestConnection={() => handleTestConnection('deepseek', deepseekApiKey)}
+                        testStatus={testStatus.deepseek || 'idle'}
+                        testError={testError.deepseek}
+                        savingStatus={!!savingStatus.deepseek}
+                        savedStatus={!!savedStatus.deepseek}
+                        keyPlaceholder="sk-..."
+                        keyUrl="https://platform.deepseek.com/api_keys"
+                        onPreferredModelChange={(model) => setPreferredModels(prev => ({ ...prev, deepseek: model }))}
+                    />
+
                 </div>
             </div>
 
@@ -744,6 +834,32 @@ export const AIProvidersSettings: React.FC = () => {
                             onSelect={(fastModel) => saveCodexCliConfig({ ...codexCliConfig, fastModel })}
                             onSave={() => saveCodexCliConfig()}
                         />
+                    </div>
+
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                        <label className="space-y-1">
+                            <span className="text-[10px] font-medium text-text-secondary uppercase tracking-wide">Service Tier</span>
+                            <ModelSelect
+                                value={codexCliConfig.serviceTier ?? 'default'}
+                                options={CODEX_SERVICE_TIERS.map(t => ({ id: t, name: t.charAt(0).toUpperCase() + t.slice(1) }))}
+                                onChange={(serviceTier) => saveCodexCliConfig({ ...codexCliConfig, serviceTier: serviceTier as typeof CODEX_SERVICE_TIERS[number] })}
+                                placeholder="default"
+                            />
+                            <p className="text-[9px] text-text-tertiary">Use faster service tier if available. Codex Cloud only.</p>
+                        </label>
+                        <label className="space-y-1">
+                            <span className="text-[10px] font-medium text-text-secondary uppercase tracking-wide">Reasoning Effort</span>
+                            <ModelSelect
+                                value={codexCliConfig.modelReasoningEffort ?? ''}
+                                options={[
+                                    { id: '', name: 'None' },
+                                    ...CODEX_MODEL_REASONING_EFFORTS.map(e => ({ id: e, name: e.charAt(0).toUpperCase() + e.slice(1) })),
+                                ]}
+                                onChange={(effort) => saveCodexCliConfig({ ...codexCliConfig, modelReasoningEffort: effort || undefined })}
+                                placeholder="None"
+                            />
+                            <p className="text-[9px] text-text-tertiary">How much reasoning effort the model uses. Model-dependent.</p>
+                        </label>
                     </div>
 
                     <div className="flex items-center justify-between gap-3">
@@ -918,6 +1034,24 @@ export const AIProvidersSettings: React.FC = () => {
                                 </p>
                             </div>
 
+                            <div>
+                                <label className="block text-xs font-medium text-text-primary uppercase tracking-wide mb-1">
+                                    Screenshot / Vision Support
+                                </label>
+                                <select
+                                    value={customVision}
+                                    onChange={(e) => setCustomVision(e.target.value as 'auto' | 'on' | 'off')}
+                                    className="w-full bg-bg-input border border-border-subtle rounded-lg px-4 py-2.5 text-xs text-text-primary focus:outline-none focus:border-accent-primary transition-colors"
+                                >
+                                    <option value="auto">Auto-detect (recommended)</option>
+                                    <option value="on">Always send screenshots</option>
+                                    <option value="off">Never send screenshots (text only)</option>
+                                </select>
+                                <p className="text-[10px] text-text-secondary mt-1">
+                                    Auto-detect enables vision when your cURL uses <code className="font-mono">{"{{IMAGE_BASE64}}"}</code> or an OpenAI-style <code className="font-mono">messages</code> body. Choose “Always” only if your endpoint accepts images another way; “Never” keeps this provider out of screenshot analysis.
+                                </p>
+                            </div>
+
                             <div className="bg-bg-elevated/30 rounded-lg overflow-hidden border border-border-subtle mt-4">
                                 <div className="px-4 py-3 bg-bg-elevated/50 border-b border-border-subtle flex items-center justify-between">
                                     <h5 className="block text-xs font-medium text-text-primary uppercase tracking-wide">
@@ -1046,6 +1180,120 @@ export const AIProvidersSettings: React.FC = () => {
                         )}
                     </div>
                 )}
+
+            {/* Screen Understanding — vision-first routing */}
+            <div className="space-y-5">
+                <div>
+                    <h3 className="text-sm font-bold text-text-primary mb-1">Screen understanding</h3>
+                    <p className="text-xs text-text-secondary mb-2">Pick how Natively reads what is on your screen. All paths use the vision-capable AI provider directly; OCR is no longer used.</p>
+                </div>
+                <div className="bg-bg-item-surface rounded-xl p-4 border border-border-subtle flex flex-col gap-2">
+                    {([
+                        {
+                            value: 'vision_first' as const,
+                            label: 'Vision first',
+                            description: 'Recommended. Try every configured vision provider in order; first success wins.',
+                        },
+                        {
+                            value: 'vision_only' as const,
+                            label: 'Vision only',
+                            description: 'Stricter. Require a vision-capable provider; never silently drop the screenshot.',
+                        },
+                        {
+                            value: 'private_vision' as const,
+                            label: 'Private vision (local only)',
+                            description: 'Use a local vision model (Ollama) only. Never call cloud vision. Clear error if no local provider is configured.',
+                        },
+                    ]).map(({ value, label, description }) => {
+                        const selected = screenUnderstandingMode === value;
+                        return (
+                            <div
+                                key={value}
+                                onClick={() => {
+                                    setScreenUnderstandingMode(value);
+                                    window.electronAPI?.setScreenUnderstandingMode?.(value);
+                                }}
+                                className={`px-3 py-2 rounded-lg border cursor-pointer transition-colors ${selected ? 'border-emerald-500/50 bg-emerald-500/10' : 'border-border-subtle hover:border-border-muted bg-bg-elevated/50'}`}
+                                role="radio"
+                                aria-checked={selected}
+                            >
+                                <div className="flex items-center justify-between gap-3">
+                                    <div className="flex flex-col">
+                                        <span className={`text-xs font-semibold ${selected ? 'text-emerald-300' : 'text-text-primary'}`}>{label}</span>
+                                        <span className="text-[11px] text-text-secondary leading-snug mt-0.5">{description}</span>
+                                    </div>
+                                    <div className={`w-4 h-4 rounded-full border-2 shrink-0 ${selected ? 'border-emerald-400 bg-emerald-400' : 'border-border-muted'}`} />
+                                </div>
+                            </div>
+                        );
+                    })}
+                    <div className="flex items-center justify-between pt-2 mt-1 border-t border-border-subtle">
+                        <div className="flex flex-col">
+                            <span className="text-xs text-text-primary font-semibold">Technical interview direct vision</span>
+                            <span className="text-[11px] text-text-secondary leading-snug mt-0.5">Use the highest-resolution image profile so code text stays sharp in interview mode.</span>
+                        </div>
+                        <div
+                            onClick={() => {
+                                const next = !technicalInterviewVisionFirst;
+                                setTechnicalInterviewVisionFirst(next);
+                                const api: any = window.electronAPI;
+                                if (api?.setTechnicalInterviewVisionFirst) {
+                                    api.setTechnicalInterviewVisionFirst(next);
+                                } else {
+                                    window.electronAPI?.setTechnicalInterviewDirectVision?.(next);
+                                }
+                            }}
+                            className={`w-9 h-5 rounded-full relative transition-colors cursor-pointer shrink-0 ${technicalInterviewVisionFirst ? 'bg-emerald-500' : 'bg-bg-toggle-switch border border-border-muted'}`}
+                            role="switch"
+                            aria-checked={technicalInterviewVisionFirst}
+                        >
+                            <div className={`absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white transition-transform ${technicalInterviewVisionFirst ? 'translate-x-4' : 'translate-x-0'}`} />
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            {/* Cloud Provider Data Scopes — fail-closed cloud share controls */}
+            <div className="space-y-5">
+                <div>
+                    <h3 className="text-sm font-bold text-text-primary mb-1">Cloud provider data scopes</h3>
+                    <p className="text-xs text-text-secondary mb-2">Control what data cloud AI providers can access. Disabled types are handled locally for privacy.</p>
+                </div>
+                <div className="bg-bg-item-surface rounded-xl p-4 border border-border-subtle flex flex-col gap-2">
+                    {([
+                        { key: 'transcript', label: 'Transcripts' },
+                        { key: 'screenshots', label: 'Screenshots' },
+                        { key: 'reference_files', label: 'Reference files' },
+                        { key: 'profile_history', label: 'Profile history' },
+                        { key: 'embeddings', label: 'Cloud embeddings' },
+                        { key: 'post_call_summary', label: 'Post-call summaries' },
+                    ] as const).map(({ key, label }) => {
+                        const allowed = providerDataScopes[key] !== false;
+                        return (
+                            <div key={key} className="flex items-center justify-between">
+                                <span className="text-xs text-text-secondary">{label}</span>
+                                <div
+                                    onClick={() => {
+                                        const next = { ...providerDataScopes, [key]: !allowed };
+                                        setProviderDataScopes(next);
+                                        window.electronAPI?.setProviderDataScopes?.(next);
+                                    }}
+                                    className={`w-9 h-5 rounded-full relative transition-colors cursor-pointer ${allowed ? 'bg-emerald-500' : 'bg-bg-toggle-switch border border-border-muted'}`}
+                                    role="switch"
+                                    aria-checked={allowed}
+                                    aria-label={`Allow ${label} to cloud providers`}
+                                >
+                                    <div className={`absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white transition-transform ${allowed ? 'translate-x-4' : 'translate-x-0'}`} />
+                                </div>
+                            </div>
+                        );
+                    })}
+                    <div className="flex items-start gap-2 mt-1 pt-3 border-t border-border-subtle">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-text-tertiary shrink-0 mt-0.5"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></svg>
+                        <p className="text-[11px] text-text-tertiary leading-relaxed">When a data type is disabled, Natively falls back to the best available local model to keep that data on-device.</p>
+                    </div>
+                </div>
+            </div>
             </div>
         </div>
     );

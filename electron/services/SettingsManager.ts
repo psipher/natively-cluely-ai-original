@@ -17,6 +17,8 @@ export interface AppSettings {
     codexCliFastModel?: string;
     codexCliTimeoutMs?: number;
     codexCliSandboxMode?: 'read-only' | 'workspace-write' | 'danger-full-access';
+    codexCliServiceTier?: 'default' | 'fast' | 'flex';
+    codexCliModelReasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh';
     knowledgeMode?: boolean;
     phoneMirrorEnabled?: boolean;
     phoneMirrorExposeOnLan?: boolean;
@@ -43,7 +45,15 @@ export interface AppSettings {
         profile_history?: boolean;
         embeddings?: boolean;
         post_call_summary?: boolean;
+        // Verified code execution: when false, the model's code is NOT sent to
+        // the cloud (Piston) runner for languages we can't run locally. Default
+        // allowed; only the cloud path consults this (local py/js never sends).
+        code_execution?: boolean;
     };
+    // Kill-switch for verified code execution (running model code against test
+    // cases in a sandbox after the answer). Default ON; set false to disable at
+    // runtime without a redeploy. Also overridable by env NATIVELY_CODE_VERIFY=off.
+    codeVerificationEnabled?: boolean;
     // Screen-understanding routing — VISION-ONLY architecture (legacy OCR removed from runtime).
     //   vision_first   — Default. Send screenshot to the first available vision-capable provider; cascade through fallback chain on failure.
     //   vision_only    — Stricter: require vision-capable provider. No text-only provider fallback. No OCR fallback.
@@ -52,6 +62,11 @@ export interface AppSettings {
     // When true (default) and the active mode is a technical / coding interview, prefer
     // direct vision LLM over structured-extract-then-answer for lowest latency.
     technicalInterviewVisionFirst?: boolean;
+    // Onboarding and gate flags for persistent settings backup
+    seenStartup?: boolean;
+    seenProfileOnboarding?: boolean;
+    seenModesOnboarding?: boolean;
+    permsShown?: boolean;
 }
 
 export const VALID_SCREEN_UNDERSTANDING_MODES = ['vision_first', 'vision_only', 'private_vision'] as const;

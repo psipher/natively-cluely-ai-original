@@ -8,6 +8,7 @@ import { DatabaseManager, Meeting } from './db/DatabaseManager';
 import { GROQ_TITLE_PROMPT, GROQ_SUMMARY_JSON_PROMPT } from './llm';
 import { buildPostCallEnhancements } from './services/post-call/PostCallWorkflow';
 import { telemetryService } from './services/telemetry/TelemetryService';
+import type { ProviderDataScopePolicy } from './llm/ProviderRouter';
 const crypto = require('crypto');
 
 export class MeetingPersistence {
@@ -49,7 +50,10 @@ export class MeetingPersistence {
             // (e.g. set via the renderer "Do not persist this meeting" toggle).
             const meta = this.session.getMeetingMetadata?.();
             if (meta && (meta as any).doNotPersist === true) doNotPersist = true;
-        } catch { /* non-fatal */ }
+        } catch (err) {
+            console.error('[MeetingPersistence] Failed to read retention settings, defaulting to discard for safety:', err);
+            doNotPersist = true; // Fail-secure fallback
+        }
         if (doNotPersist) {
             console.log('[MeetingPersistence] doNotPersist set — skipping save (no DB row, no summary).');
             try {
@@ -210,7 +214,7 @@ export class MeetingPersistence {
                     //   - `post_call_summary === false` → no mode context at all
                     //   - `reference_files === false`   → customContext only, no retrieved snippets
                     if (modeSnapshot) {
-                        let scopePolicy: any = undefined;
+                        let scopePolicy: ProviderDataScopePolicy | undefined = undefined;
                         try {
                             const { SettingsManager } = require('./services/SettingsManager');
                             scopePolicy = SettingsManager.getInstance().get('providerDataScopes');
@@ -227,7 +231,7 @@ export class MeetingPersistence {
                                 includeReferenceSnippets: referenceSnippetsAllowed,
                             }) || '';
                         } else {
-                            console.log('[MeetingPersistence] post_call_summary scope denied — skipping mode context injection');
+                            console.warn('[ScopeFallback] post_call_summary denied for cloud; routing to Ollama');
                             modeContextBlock = '';
                         }
                     }

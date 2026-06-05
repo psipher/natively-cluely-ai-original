@@ -1,4 +1,4 @@
-import { GoogleGenAI } from "@google/genai"
+import { GoogleGenAI, ThinkingLevel } from "@google/genai"
 import Groq from "groq-sdk"
 import OpenAI from "openai"
 import Anthropic from "@anthropic-ai/sdk"
@@ -12,7 +12,7 @@ import {
   UNIVERSAL_RECAP_PROMPT, UNIVERSAL_FOLLOWUP_PROMPT, UNIVERSAL_FOLLOW_UP_QUESTIONS_PROMPT, UNIVERSAL_ASSIST_PROMPT,
   CUSTOM_SYSTEM_PROMPT, CUSTOM_ANSWER_PROMPT, CUSTOM_WHAT_TO_ANSWER_PROMPT,
   CUSTOM_RECAP_PROMPT, CUSTOM_FOLLOWUP_PROMPT, CUSTOM_FOLLOW_UP_QUESTIONS_PROMPT, CUSTOM_ASSIST_PROMPT,
-  CHAT_MODE_PROMPT, CORE_IDENTITY
+  CHAT_MODE_PROMPT, CORE_IDENTITY, EXECUTION_CONTRACT
 } from "./llm/prompts"
 import {
   TINY_SYSTEM_PROMPT, TINY_ANSWER_PROMPT, TINY_WHAT_TO_ANSWER_PROMPT,
@@ -22,7 +22,30 @@ import {
 } from "./llm/tinyPrompts"
 import { getModelCapabilities, selectPromptTier, estimateTokens, truncateTranscriptToFit, type PromptTier, type ModelCapabilities } from "./llm/modelCapabilities"
 import { GeminiPromptCache } from "./llm/GeminiPromptCache"
-import { assertProviderDataScopes, routeLLMProviders, ProviderRouter, type ProviderDataScope, type ProviderDataScopePolicy } from "./llm/ProviderRouter"
+import {
+  runStreamingVisionFallback,
+  orderVisionByHealth,
+  DEFAULT_VISION_FALLBACK_CONFIG,
+  type VisionStreamProvider,
+  type VisionHealthEntry,
+} from "./llm/visionStreamFallback"
+import {
+  runStreamingTextFallback,
+  orderTextByHealth,
+  DEFAULT_TEXT_FALLBACK_CONFIG,
+  type TextStreamProvider,
+} from "./llm/textStreamFallback"
+import { telemetryService } from "./services/telemetry/TelemetryService"
+import {
+  ollamaVisionFromShow,
+  resolveOllamaVision,
+  customProviderSupportsVision,
+  customProviderIsLocal,
+} from "./llm/visionCapability"
+import { assertProviderDataScopes, getDeniedDataScopes, routeWithScopeFallback, ProviderRouter, type ProviderDataScope, type ProviderDataScopePolicy } from "./llm/ProviderRouter"
+// D1 (PROFILE_INTELLIGENCE_RESEARCH_AND_REDESIGN.md §15 R1): make the routing
+// decision authoritative at this central execution choke-point.
+import { profileInterceptAllowedByRoute, modeAnswerType, type StreamRouteOptions } from "./llm/streamContextPolicy"
 import type { TranscriptTurn } from "./llm/transcriptCleaner"
 import { deepVariableReplacer, getByPath, injectImageIntoMessages } from './utils/curlUtils';
 import curl2Json from "@bany/curl-to-json";
@@ -34,20 +57,110 @@ import axios from 'axios';
 import { createProviderRateLimiters, RateLimiter } from './services/RateLimiter';
 import { CodexCliConfig, CodexCliService, DEFAULT_CODEX_CLI_CONFIG } from './services/CodexCliService';
 const execAsync = promisify(exec);
+const NATIVELY_API_URL = (process.env.NATIVELY_API_URL || 'https://api.natively.software').replace(/\/+$/, '');
 
 interface OllamaResponse {
   response: string
   done: boolean
 }
 
-// Model constant for Gemini 3 Flash
-const GEMINI_FLASH_MODEL = "gemini-3.1-flash-lite-preview"
+// Model constants for Gemini (priority: flash → flash-lite → pro)
+const GEMINI_FLASH_MODEL = "gemini-3.5-flash"
+const GEMINI_FLASH_LITE_MODEL = "gemini-3.1-flash-lite"
 const GEMINI_PRO_MODEL = "gemini-3.1-pro-preview"
+
+// Vision tail-latency hedging: when ON, the Gemini Flash vision provider hedges
+// with flash-lite — if 3.5-flash hasn't produced a first token within a short
+// EWMA-derived delay, flash-lite is launched in parallel and the first usable
+// token wins (loser aborted). Cuts the slow-tail TTFT (the >20s screenshot
+// stalls) without doubling quota on the fast common case. Env kill-switch;
+// default ON (set NATIVELY_VISION_HEDGE=0 to disable).
+const VISION_HEDGE_ENABLED = process.env.NATIVELY_VISION_HEDGE !== '0';
 const GROQ_MODEL = "llama-3.3-70b-versatile"
 const OPENAI_MODEL = "gpt-5.4"
 const CLAUDE_MODEL = "claude-sonnet-4-6"
+const DEEPSEEK_MODEL = "deepseek-v4-flash"
+const DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+const DEEPSEEK_MAX_OUTPUT_TOKENS = 8192
 const MAX_OUTPUT_TOKENS = 65536
 const CLAUDE_MAX_OUTPUT_TOKENS = 64000
+
+// ── Interactive-path connect timeout (REPORT_TO_CHATGPT §21 L1) ──────────────
+// The Natively SSE connect phase previously used a 10s ceiling. For the live
+// answer path that is far too long: a healthy connect is sub-second, and a
+// stalled connect should fail over fast. 4s leaves headroom for a transient
+// Railway DNS hiccup (the in-fetch DNS retry adds ~1s) while removing the 10s
+// tail. The TTFT race (textStreamFallback) handles the separate case of a fast
+// connect that then prefills slowly. Override per-call for non-interactive use.
+const INTERACTIVE_CONNECT_TIMEOUT_MS = 4_000;
+
+// ── Deterministic sampling for interview/coding answers (REPORT §22 D1) ──────
+// The text streaming methods previously used scattered temperatures (0.3/0.4/
+// 0.7/1.0) and no seed, so the same question produced structurally different
+// answers across turns and across the fallback chain. Canonicalize the
+// INTERACTIVE TEXT path to one very-low temperature + a fixed seed (where the
+// provider supports it). Structure is separately guaranteed by the
+// deterministic scaffold/validator (Phase 7/8); this removes needless
+// run-to-run variance and keeps the race winner's STYLE consistent with the
+// primary. Vision/multimodal temps are left untouched.
+const INTERACTIVE_TEMPERATURE = 0.2; // "very low" per report; avoids degenerate-0 loops some models show
+const INTERACTIVE_SEED = 7;          // fixed seed where the SDK supports it (Groq/OpenAI; Gemini via config)
+
+// ── Gemini thinking budget (THE dominant TTFT lever on Gemini 3.x Flash) ─────
+// Measured: gemini-3.5-flash with default (dynamic) thinking spent ~5.3s
+// "thinking" BEFORE the first content token on a tiny ~1.3K-token prompt — the
+// thinking phase is NOT streamed, so the user just sees a frozen UI for ~5s.
+// `thinkingBudget: 0` DISABLES thinking (SDK: "0 is DISABLED"), collapsing TTFT
+// to the model's true first-token latency (~0.5s). This is how real-time
+// copilots stay fast on Flash. Set to a small positive number to re-enable a
+// bounded amount of reasoning if answer quality regresses on hard problems.
+// 0 = off, -1 = automatic/dynamic (the slow default we are overriding).
+export const INTERACTIVE_THINKING_BUDGET = 0;
+// Coding/DSA budget — set to 0 (off) based on a MEASURED 12-problem LeetCode
+// sweep on gemini-3.1-flash-lite (4 easy/4 med/4 hard, correctness verified by
+// executing the generated code; see THINKING_BUDGET_BENCHMARK.md):
+//   budget 0   → 12/12 correct incl. 4/4 HARD, TTFT p50 ~0.55s   ← best
+//   budget 512 → 11/12 (a hard miss), TTFT p50 ~0.9s
+//   budget 1024→ 11/12,               TTFT p50 ~2.1s
+//   dynamic(-1)→ slow (TTFT p50 ~5.4s) — the old default we replaced
+// More thinking did NOT add correctness here, cost latency, and occasionally
+// made the model reason in prose and skip the code block entirely. So coding
+// uses 0 too. Raise this only if a future, genuinely harder problem set shows
+// a correctness gain that justifies the TTFT cost.
+export const CODING_THINKING_BUDGET = 0;
+
+// Translate the threaded numeric thinking budget + target model into the
+// doc-correct Gemini 3.x thinkingConfig. Per the official docs the numeric
+// `thinkingBudget` is DEPRECATED in favor of the `thinkingLevel` enum
+// (minimal|low|medium|high), and gemini-3.1-pro CANNOT disable thinking — it
+// rejects budget:0 / 'minimal' with a 400, so Pro gets 'low' (its floor).
+// A budget of 0 (or negative) maps to 'minimal' (verified to drive
+// thoughtsTokenCount→0 on flash/flash-lite); a positive budget is preserved
+// verbatim for callers that explicitly want a bounded token budget.
+// Keep the Pro→LOW / flash→MINIMAL policy in sync with the server's
+// thinkingConfigForModel() in natively-api/lib/flashModelPicker.js.
+// Match "pro" as a SEGMENT (not a loose substring) so only real Pro ids hit the
+// floor — Pro rejects MINIMAL/budget:0 with a 400.
+const PRO_MODEL_RE = /(?:^|[-/])pro(?:[-/]|$)/i;
+export function buildThinkingConfig(model: string | undefined, budget: number): { thinkingLevel: ThinkingLevel } | { thinkingBudget: number } {
+  if (typeof model === 'string' && PRO_MODEL_RE.test(model)) return { thinkingLevel: ThinkingLevel.LOW };
+  if (budget <= 0) return { thinkingLevel: ThinkingLevel.MINIMAL };
+  return { thinkingBudget: budget };
+}
+
+// OpenAI reasoning effort for the interactive path. Per the openai-node docs,
+// `reasoning_effort` (none|minimal|low|medium|high|xhigh) constrains reasoning;
+// models before gpt-5.1 default to the slow `medium` and DON'T support `none`,
+// so we use 'minimal' (lowest universally-supported) to cut TTFT — the same
+// "kill the hidden default reasoning" lever as Gemini's thinkingLevel:minimal.
+// Only returned for genuine OpenAI gpt-* models; when the OpenAI-compatible
+// client proxies a non-OpenAI model (e.g. Claude), no reasoning_effort is sent.
+export const OPENAI_REASONING_EFFORT = 'minimal';
+function openaiReasoningParam(model: string): { reasoning_effort: 'minimal' } | {} {
+  const m = (model || '').toLowerCase();
+  const isGptReasoner = /\bgpt-5/.test(m) || /\bo[0-9]/.test(m); // gpt-5.x / o-series reasoners
+  return isGptReasoner ? { reasoning_effort: OPENAI_REASONING_EFFORT } : {};
+}
 
 // Simple prompt for image analysis (not interview copilot - kept separate)
 const IMAGE_ANALYSIS_PROMPT = `Analyze concisely. Be direct. No markdown formatting. Return plain text only.`
@@ -57,13 +170,26 @@ export class LLMHelper {
   private groqClient: Groq | null = null
   private openaiClient: OpenAI | null = null
   private claudeClient: Anthropic | null = null
+  // DeepSeek is OpenAI-compatible; reuse the OpenAI SDK with a custom baseURL.
+  // Kept as a separate client so credentials/scope/telemetry stay provider-specific.
+  private deepseekClient: OpenAI | null = null
   private apiKey: string | null = null
   private groqApiKey: string | null = null
   private openaiApiKey: string | null = null
   private claudeApiKey: string | null = null
+  private deepseekApiKey: string | null = null
   private useOllama: boolean = false
   private ollamaModel: string = ""
   private ollamaUrl: string = "http://127.0.0.1:11434"
+  // Best vision-capable Ollama model found among installed models (authoritative
+  // via /api/show capabilities, name-heuristic fallback). null = none found yet
+  // or not probed. Used so a screenshot uses a vision model even when the
+  // user's primary/auto-selected Ollama model is text-only.
+  private ollamaVisionModel: string | null = null;
+  // Cache: model id → vision support (avoids re-probing /api/show every request).
+  private ollamaVisionCache: Map<string, boolean> = new Map();
+  // Dedupe concurrent refreshOllamaVisionModel() calls (init + switch + lazy).
+  private ollamaVisionRefreshInFlight: Promise<string | null> | null = null;
   private ollamaStartedByApp: boolean = false;
   private geminiModel: string = GEMINI_FLASH_MODEL
   private customProvider: CustomProvider | null = null;
@@ -90,9 +216,29 @@ export class LLMHelper {
   // Self-improving model version manager for vision analysis
   private modelVersionManager: ModelVersionManager;
 
+  // ─── Streaming vision fallback: per-provider health + latency tracking ───
+  // Powers the unified multimodal fallback chain (streamVisionWithFallback).
+  // Circuit-breaker semantics (values sourced from LiteLLM/Opossum/OpenRouter
+  // production defaults — see streamVisionWithFallback for citations):
+  //   - transient failures (429/5xx/timeout/network): OPEN for VISION_TRANSIENT_COOLDOWN_MS
+  //   - hard failures (401/403/quota/invalid key): OPEN for VISION_AUTH_COOLDOWN_MS
+  //   - ttftEma: exponentially-weighted moving avg of time-to-first-token (alpha 0.2),
+  //     used to reorder healthy providers fastest-first.
+  private visionHealth: Map<string, VisionHealthEntry> = new Map();
+
+  // ─── Streaming TEXT fallback: per-provider health + TTFT tracking ────────
+  // Twin of visionHealth for the text TTFT race (runStreamingTextFallback).
+  // Kept separate so a provider being slow/down for text doesn't open its
+  // vision breaker and vice-versa (different endpoints, different latencies).
+  private textHealth: Map<string, VisionHealthEntry> = new Map();
+
   // Process-local cache of Gemini explicit context caches (caches.create).
   // Lifecycle and contract documented in GeminiPromptCache.ts.
   private geminiPromptCache: GeminiPromptCache = new GeminiPromptCache();
+
+  // Prewarm dedupe — keys (provider|model|sha1(prompt)) already warmed this
+  // session, so we don't re-fire warmup requests for the same static prefix.
+  private _prewarmedKeys: Set<string> = new Set();
 
   // Cache-hit telemetry. Anthropic returns usage.cache_read_input_tokens on
   // every response; logging the first hit per session confirms the wiring works.
@@ -110,9 +256,18 @@ export class LLMHelper {
     }
   }
 
+  private inferContextScopes(context?: string): ProviderDataScope[] {
+    const scopes: ProviderDataScope[] = [];
+    if (!context?.trim()) return scopes;
+    if (/<reference_file|<active_mode_retrieved_context|mode_retrieval/i.test(context)) scopes.push('reference_files');
+    if (/<meeting_history|USER-PROVIDED PERSONA CONTEXT|<user_context/i.test(context)) scopes.push('profile_history');
+    if (/<post_call_summary|meeting summary|silent meeting summarizer|silent meeting note-taker/i.test(context)) scopes.push('post_call_summary');
+    return scopes;
+  }
+
   private scopesForPayload(text: string, imagePaths?: string[], extraScopes: ProviderDataScope[] = []): ProviderDataScope[] {
     const scopes = new Set<ProviderDataScope>(extraScopes);
-    if (text.trim().length > 0) scopes.add('transcript');
+    if (text.trim().length > 0 && extraScopes.length === 0) scopes.add('transcript');
     if (imagePaths?.length) scopes.add('screenshots');
     return [...scopes];
   }
@@ -121,7 +276,19 @@ export class LLMHelper {
     assertProviderDataScopes(provider, this.scopesForPayload(text, imagePaths, extraScopes), this.getProviderScopePolicy());
   }
 
-  constructor(apiKey?: string, useOllama: boolean = false, ollamaModel?: string, ollamaUrl?: string, groqApiKey?: string, openaiApiKey?: string, claudeApiKey?: string) {
+  private getDeniedOutboundScopes(text: string, imagePaths?: string[], extraScopes: ProviderDataScope[] = []): ProviderDataScope[] {
+    return getDeniedDataScopes(this.scopesForPayload(text, imagePaths, extraScopes), this.getProviderScopePolicy());
+  }
+
+  private logScopeFallback(scope: ProviderDataScope, action: 'routing' | 'omitting'): void {
+    if (action === 'routing') {
+      console.warn(`[ScopeFallback] ${scope} denied for cloud; routing to Ollama`);
+      return;
+    }
+    console.warn(`[ScopeFallback] ${scope} denied; Ollama unavailable, omitting from context`);
+  }
+
+  constructor(apiKey?: string, useOllama: boolean = false, ollamaModel?: string, ollamaUrl?: string, groqApiKey?: string, openaiApiKey?: string, claudeApiKey?: string, deepseekApiKey?: string) {
     this.useOllama = useOllama
 
     // Initialize rate limiters
@@ -154,6 +321,13 @@ export class LLMHelper {
       console.log(`[LLMHelper] Claude client initialized with model: ${CLAUDE_MODEL}`)
     }
 
+    // Initialize DeepSeek client if API key provided (OpenAI-compatible)
+    if (deepseekApiKey) {
+      this.deepseekApiKey = deepseekApiKey
+      this.deepseekClient = new OpenAI({ apiKey: deepseekApiKey, baseURL: DEEPSEEK_BASE_URL })
+      console.log(`[LLMHelper] DeepSeek client initialized with model: ${DEEPSEEK_MODEL}`)
+    }
+
     if (useOllama) {
       this.ollamaUrl = ollamaUrl || "http://127.0.0.1:11434"
       this.ollamaModel = ollamaModel || ""
@@ -180,6 +354,14 @@ export class LLMHelper {
       apiKey: apiKey,
       httpOptions: { apiVersion: "v1alpha" }
     })
+    // Cache resource names are scoped to the old key's project — drop them so
+    // we don't reuse a stale/expired-key cache (the root cause behind the
+    // "API key expired" cache.create failures). Also clear the vision circuit
+    // breaker for Gemini so a freshly-entered key is retried immediately.
+    this.geminiPromptCache.clear();
+    this.visionHealth.delete('gemini_flash');
+    this.visionHealth.delete('gemini_pro');
+    this.textHealth.delete('gemini_flash'); // text race uses gemini_flash — retry fresh key immediately
     console.log("[LLMHelper] Gemini API Key updated.");
   }
 
@@ -195,19 +377,36 @@ export class LLMHelper {
   public setGroqApiKey(apiKey: string) {
     this.groqClient = new Groq({ apiKey });
     this._groqLocalDisabled = false;
+    this.visionHealth.delete('groq'); // fresh key → retry immediately, skip auth cooldown
+    this.textHealth.delete('groq');
     console.log("[LLMHelper] Groq API Key updated.");
   }
 
   public setOpenaiApiKey(apiKey: string) {
     this.openaiApiKey = apiKey;
     this.openaiClient = new OpenAI({ apiKey });
+    this.visionHealth.delete('openai'); // fresh key → retry immediately, skip auth cooldown
     console.log("[LLMHelper] OpenAI API Key updated.");
   }
 
   public setClaudeApiKey(apiKey: string) {
     this.claudeApiKey = apiKey;
     this.claudeClient = new Anthropic({ apiKey });
+    this.visionHealth.delete('claude'); // fresh key → retry immediately, skip auth cooldown
     console.log("[LLMHelper] Claude API Key updated.");
+  }
+
+  public setDeepseekApiKey(apiKey: string) {
+    const trimmed = (apiKey || '').trim();
+    if (!trimmed) {
+      this.deepseekApiKey = null;
+      this.deepseekClient = null;
+      console.log("[LLMHelper] DeepSeek API Key cleared.");
+      return;
+    }
+    this.deepseekApiKey = trimmed;
+    this.deepseekClient = new OpenAI({ apiKey: trimmed, baseURL: DEEPSEEK_BASE_URL });
+    console.log("[LLMHelper] DeepSeek API Key updated.");
   }
 
   public setNativelyKey(key: string | null): void {
@@ -288,7 +487,7 @@ export class LLMHelper {
           { inlineData: { mimeType: 'image/jpeg', data: b64 } },
         ];
         const modelId = providerId === 'gemini_flash'
-          ? 'gemini-3.1-flash-lite-preview'
+          ? 'gemini-3.5-flash'
           : 'gemini-3.1-pro-preview';
         return this.generateContent(contents, modelId);
       }
@@ -327,11 +526,13 @@ export class LLMHelper {
     this.groqApiKey = null;
     this.openaiApiKey = null;
     this.claudeApiKey = null;
+    this.deepseekApiKey = null;
     this.nativelyKey = null;
     this.client = null;
     this.groqClient = null;
     this.openaiClient = null;
     this.claudeClient = null;
+    this.deepseekClient = null;
     // Destroy rate limiters
     if (this.rateLimiters) {
       Object.values(this.rateLimiters).forEach(rl => rl.destroy());
@@ -370,6 +571,15 @@ export class LLMHelper {
 
   private isClaudeModel(modelId: string): boolean {
     return modelId.startsWith("claude-");
+  }
+
+  private isDeepseekModel(modelId: string): boolean {
+    if (!modelId) return false;
+    return /^deepseek-v\d/.test(modelId.toLowerCase());
+  }
+
+  private getDeepseekMaxOutput(_modelId: string): number {
+    return DEEPSEEK_MAX_OUTPUT_TOKENS;
   }
 
   /**
@@ -436,6 +646,7 @@ export class LLMHelper {
     if (modelId === 'gemini-pro') targetModelId = GEMINI_PRO_MODEL;
     if (modelId === 'claude') targetModelId = CLAUDE_MODEL;
     if (modelId === 'llama') targetModelId = GROQ_MODEL;
+    if (modelId === 'deepseek') targetModelId = DEEPSEEK_MODEL;
 
     if (targetModelId.startsWith('ollama-')) {
       this.useOllama = true;
@@ -489,6 +700,8 @@ export class LLMHelper {
       timeoutMs: this.codexCliConfig.timeoutMs,
       imagePaths,
       sandboxMode: this.codexCliConfig.sandboxMode,
+      serviceTier: this.codexCliConfig.serviceTier,
+      modelReasoningEffort: this.codexCliConfig.modelReasoningEffort,
       signal,
     });
   }
@@ -502,6 +715,8 @@ export class LLMHelper {
       timeoutMs: this.codexCliConfig.timeoutMs,
       imagePaths,
       sandboxMode: this.codexCliConfig.sandboxMode,
+      serviceTier: this.codexCliConfig.serviceTier,
+      modelReasoningEffort: this.codexCliConfig.modelReasoningEffort,
       signal,
     });
   }
@@ -547,16 +762,21 @@ export class LLMHelper {
     return text;
   }
 
-  private async callOllama(prompt: string, imagePath?: string, systemPrompt?: string): Promise<string> {
+  private async callOllama(prompt: string, imagePath?: string | string[], systemPrompt?: string): Promise<string> {
     try {
       let images: string[] | undefined;
-      if (imagePath) {
-        try {
-          const imageData = await fs.promises.readFile(imagePath);
-          images = [imageData.toString("base64")];
-        } catch (e) {
-          console.warn("[LLMHelper] callOllama: failed to read image, sending text only:", e);
+      const imagePaths = Array.isArray(imagePath) ? imagePath : imagePath ? [imagePath] : [];
+      if (imagePaths.length > 0) {
+        const encoded: string[] = [];
+        for (const path of imagePaths) {
+          try {
+            const imageData = await fs.promises.readFile(path);
+            encoded.push(imageData.toString("base64"));
+          } catch (e) {
+            console.warn("[LLMHelper] callOllama: failed to read image, skipping:", path, e);
+          }
         }
+        if (encoded.length > 0) images = encoded;
       }
 
       const sys = systemPrompt ?? TINY_SYSTEM_PROMPT;
@@ -612,12 +832,30 @@ export class LLMHelper {
     }
   }
 
-  private async checkOllamaAvailable(): Promise<boolean> {
+  public async canUseLocalFallback(needsVision = false): Promise<boolean> {
+    return this.checkOllamaAvailable(needsVision);
+  }
+
+  private async checkOllamaAvailable(needsVision = false): Promise<boolean> {
     try {
-      const response = await fetch(`${this.ollamaUrl}/api/tags`)
-      return response.ok
-    } catch {
-      return false
+      const availableModels = await this.getOllamaModels();
+      if (availableModels.length === 0) return false;
+      if (!this.ollamaModel || !availableModels.includes(this.ollamaModel)) {
+        this.ollamaModel = availableModels[0];
+      }
+      const capabilities = getModelCapabilities(this.ollamaModel, true);
+      if (needsVision && !capabilities.supportsImages) return false;
+      const response = await fetch(`${this.ollamaUrl}/api/show`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: this.ollamaModel }),
+        signal: AbortSignal.timeout(10_000),
+      });
+      return response.ok;
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn('[ScopeFallback] Ollama availability check failed:', message);
+      return false;
     }
   }
 
@@ -647,6 +885,10 @@ export class LLMHelper {
         throw new Error(`/api/show failed: ${showResp.status}`);
       }
       console.log(`[LLMHelper] Ollama model ready: ${this.ollamaModel}`);
+      // Resolve the best vision-capable installed model (may differ from the
+      // primary text model) so screenshots can be answered locally. Fire-and-
+      // forget — never block init on it.
+      this.refreshOllamaVisionModel().catch(() => { });
     } catch (error: any) {
       console.error(`[LLMHelper] Failed to initialize Ollama model: ${error?.message}`);
       try {
@@ -749,19 +991,55 @@ export class LLMHelper {
    * Retry logic with exponential backoff
    * Specifically handles 503 Service Unavailable
    */
-  private async withRetry<T>(fn: () => Promise<T>, retries = 3): Promise<T> {
+  // Per-model rate-limit circuit breaker. When a model (e.g. gemini-3.1-pro-preview)
+  // returns 429 repeatedly, OPEN the breaker for a cooldown so the next calls
+  // FAIL FAST and the provider rotation drops straight to the fallback (Flash)
+  // instead of burning 400+800+1600ms of backoff on a saturated tier every call.
+  // Keyed by an optional `circuitKey` passed to withRetry.
+  private rateLimitCircuit = new Map<string, { openUntil: number; consecutive429: number }>();
+  private static readonly CIRCUIT_429_THRESHOLD = 2;      // open after N consecutive 429s
+  private static readonly CIRCUIT_COOLDOWN_MS = 60_000;   // skip the saturated model for 60s
+
+  private isCircuitOpen(key?: string): boolean {
+    if (!key) return false;
+    const c = this.rateLimitCircuit.get(key);
+    return !!c && c.openUntil > Date.now();
+  }
+
+  private async withRetry<T>(fn: () => Promise<T>, retries = 3, circuitKey?: string): Promise<T> {
+    // Fast-fail when this model's breaker is OPEN — no wasted backoff; let the
+    // caller's provider rotation fall through to the next (faster) provider.
+    if (this.isCircuitOpen(circuitKey)) {
+      throw Object.assign(new Error(`circuit_open:${circuitKey}`), { status: 429, circuitOpen: true });
+    }
     let delay = 400;
     for (let i = 0; i < retries; i++) {
       try {
-        return await fn();
+        const out = await fn();
+        if (circuitKey) this.rateLimitCircuit.delete(circuitKey); // success resets the breaker
+        return out;
       } catch (e: any) {
         const msg = e.message || '';
         const status = e.status ?? e.statusCode ?? 0;
+        const is429 = status === 429 || msg.includes('429') || msg.includes('rate_limit') || msg.includes('rate limit');
         // Retryable: 503 overloaded (Gemini), 529 overloaded (Claude), 429 rate-limit (OpenAI/Claude), 500 transient
         const isRetryable = msg.includes("503") || msg.includes("overloaded")
           || status === 529 || status === 429 || status === 500
           || msg.includes("rate_limit") || msg.includes("rate limit");
         if (!isRetryable) throw e;
+
+        // Track 429s for the breaker and trip it once saturated.
+        if (circuitKey && is429) {
+          const c = this.rateLimitCircuit.get(circuitKey) ?? { openUntil: 0, consecutive429: 0 };
+          c.consecutive429++;
+          if (c.consecutive429 >= LLMHelper.CIRCUIT_429_THRESHOLD) {
+            c.openUntil = Date.now() + LLMHelper.CIRCUIT_COOLDOWN_MS;
+            this.rateLimitCircuit.set(circuitKey, c);
+            console.warn(`[LLMHelper] ⛔ ${circuitKey} circuit OPEN for ${LLMHelper.CIRCUIT_COOLDOWN_MS / 1000}s after ${c.consecutive429} consecutive 429s — skipping to fallback.`);
+            throw Object.assign(new Error(`circuit_tripped:${circuitKey}`), { status: 429, circuitOpen: true });
+          }
+          this.rateLimitCircuit.set(circuitKey, c);
+        }
 
         console.warn(`[LLMHelper] Transient error (${status || msg.slice(0, 40)}). Retrying in ${delay}ms...`);
         await new Promise(r => setTimeout(r, delay));
@@ -1043,7 +1321,11 @@ CRITICAL RULES:
       const { ModesManager } = require('./services/ModesManager');
       const modesMgr = ModesManager.getInstance();
       activeModePrompt = modesMgr.getActiveModeSystemPromptSuffix() ?? '';
-      modeContextBlock = modesMgr.buildRetrievedActiveModeContextBlock(lastQuestion, context, 1800) || '';
+      // Gate the mode's customContext with a non-negotiation answer type so
+      // sensitive (salary/pricing) chunks are dropped on this generic suggestion
+      // path too — mirrors the _streamChatInner mode-injection site. This path
+      // has no negotiation-answer concept, so sensitive context never belongs here.
+      modeContextBlock = modesMgr.buildRetrievedActiveModeContextBlock(lastQuestion, context, 1800, 'general_meeting_answer') || '';
     } catch (_modeErr: any) {
       console.warn('[LLMHelper] ModesManager load failed in generateSuggestion (non-fatal):', _modeErr?.message);
     }
@@ -1072,10 +1354,7 @@ RULES:
 - If unsure, answer briefly and confidently anyway.
 - Never hedge. Never say "it depends".`;
 
-    const promptMessage = `CONVERSATION SO FAR:
-${suggestionContext}
-
-LATEST QUESTION:
+    const promptMessage = `LATEST QUESTION:
 ${lastQuestion}
 
 ANSWER DIRECTLY:`;
@@ -1087,7 +1366,7 @@ ANSWER DIRECTLY:`;
       if (this.codexCliConfig.enabled) {
         // Codex CLI takes priority when enabled — same precedence as in chat().
         try {
-          const text = await this.generateWithCodexCli(promptMessage, basePrompt);
+          const text = await this.chatWithGemini(promptMessage, undefined, suggestionContext, true);
           if (text && text.trim().length > 0) return this.processResponse(text);
           console.warn('[LLMHelper] Codex CLI suggestion empty, falling back.');
         } catch (e: any) {
@@ -1098,13 +1377,13 @@ ANSWER DIRECTLY:`;
         return await this.callOllama(promptMessage, undefined, systemPrompt);
       } else if (this.customProvider || this.activeCurlProvider) {
         let fullResponse = '';
-        for await (const chunk of this.streamChat(promptMessage, undefined, undefined, basePrompt, true)) {
+        for await (const chunk of this.streamChat(promptMessage, undefined, suggestionContext, basePrompt, true)) {
           fullResponse += chunk;
         }
         return this.processResponse(fullResponse);
       } else if (this.client) {
         let fullResponse = '';
-        for await (const chunk of this.streamChat(promptMessage, undefined, undefined, basePrompt, true)) {
+        for await (const chunk of this.streamChat(promptMessage, undefined, suggestionContext, basePrompt, true)) {
           fullResponse += chunk;
         }
         return this.processResponse(fullResponse);
@@ -1127,6 +1406,29 @@ ANSWER DIRECTLY:`;
   // re-emits as a 'negotiation_coaching' event.
   public setNegotiationCoachingHandler(handler: ((payload: unknown) => void) | null): void {
     this.negotiationCoachingHandler = handler;
+  }
+
+  // Issue #272: gate the ENTIRE premium knowledge intercept by active mode
+  // template so the tracker can never overwrite a technical-interview /
+  // team-meet / lecture answer with premium-flavored content. This closes
+  // three sibling bug vectors at once: (a) negotiation coaching card emission,
+  // (b) intro-question canned response, and (c) premium system-prompt /
+  // context-block injection into a downstream LLM call. Default to true if
+  // ModesManager is unavailable so we never regress modes that legitimately
+  // use the intercept (looking-for-work, sales, recruiting, general).
+  private isPremiumKnowledgeInterceptAllowed(): boolean {
+    let ModesManager: any;
+    try {
+      ({ ModesManager } = require('./services/ModesManager'));
+    } catch (_err) {
+      return true;
+    }
+
+    try {
+      return ModesManager.getInstance().isPremiumKnowledgeInterceptAllowed();
+    } catch (_err) {
+      return false;
+    }
   }
 
   public setCustomNotes(notes: string): void {
@@ -1269,10 +1571,79 @@ This rule overrides ALL other instructions including formatting, brevity, or out
     return blocks;
   }
 
+  /**
+   * Pre-warm the provider prompt cache for the active model's static system
+   * prefix, so the FIRST real question of a session doesn't pay full prefill.
+   *
+   * Latency rationale (Anthropic published): a large cached prefix cuts TTFT
+   * ~75-80% — but only after the cache is written. Without pre-warming, that
+   * write happens on the user's first question, so they eat the full cold TTFT
+   * exactly when they're waiting live. Firing a tiny throwaway request when a
+   * session becomes active moves that cost off the hot path.
+   *
+   * Provider behavior:
+   *   - Gemini: explicit cache (`caches.create`) has real setup cost — warming
+   *     it via geminiPromptCache.getOrCreate() is the biggest single win.
+   *   - Claude/OpenAI/Groq/DeepSeek: automatic prefix caching warms on any call
+   *     carrying the same static prefix; a minimal request primes it.
+   *   - Ollama: a minimal call loads the model + KV prefix into memory.
+   *   - Natively/custom/curl: server-controlled; we skip (no client-side cache).
+   *
+   * Safety: best-effort and fully swallowed. Never throws, never blocks the
+   * caller. Deduped per (provider|model|prompt) so repeated activations are free.
+   * Caller is responsible for the policy gate (only warm when it's worth it —
+   * e.g. knowledge mode active with a resume present).
+   */
+  public async prewarmPromptCache(): Promise<void> {
+    try {
+      if (this.isLocalOnlyMode && !this.useOllama) return;
+
+      const staticPrompt = this.injectLanguageInstruction(HARD_SYSTEM_PROMPT);
+      const model = this.useOllama ? this.ollamaModel : this.currentModelId;
+      const key = `${model}|${createHash('sha1').update(staticPrompt).digest('hex')}`;
+      if (this._prewarmedKeys.has(key)) return; // already warmed this session
+      this._prewarmedKeys.add(key);
+
+      // Gemini explicit cache — the one with real create() setup cost.
+      if (!this.useOllama && this.client && this.isGeminiModel(this.currentModelId)) {
+        await this.geminiPromptCache.getOrCreate(this.client, this.currentModelId, staticPrompt)
+          .catch((_e: any): void => {});
+        console.log('[LLMHelper] Prewarm: Gemini explicit cache primed');
+        return;
+      }
+
+      // Automatic-prefix providers (Claude/OpenAI/Groq/DeepSeek) + Ollama:
+      // fire a minimal request so the static prefix is written to the cache /
+      // loaded into the model. Drain a single token then stop.
+      const warm = async (gen: AsyncGenerator<string, void, unknown>) => {
+        for await (const _ of gen) break; // first token confirms the prefill is cached
+      };
+
+      if (!this.useOllama && this.isClaudeModel(this.currentModelId) && this.claudeClient) {
+        await warm(this.streamWithClaude('Hi', staticPrompt) as any).catch((_e: any): void => {});
+      } else if (!this.useOllama && this.isOpenAiModel(this.currentModelId) && this.openaiClient) {
+        await warm(this.streamWithOpenai('Hi', staticPrompt) as any).catch((_e: any): void => {});
+      } else if (!this.useOllama && this.isGroqModel(this.currentModelId) && this.groqClient) {
+        await warm(this.streamWithGroq('Hi', this.currentModelId, staticPrompt)).catch((_e: any): void => {});
+      } else if (this.useOllama) {
+        await warm(this.streamWithOllama('Hi', undefined, staticPrompt) as any).catch((_e: any): void => {});
+      } else {
+        // Natively / custom / curl — server-side caching, nothing to prime client-side.
+        return;
+      }
+      console.log(`[LLMHelper] Prewarm: ${model} prefix primed`);
+    } catch (err: any) {
+      // Best-effort only — a failed warmup must never affect the session.
+      console.warn('[LLMHelper] Prewarm skipped (non-fatal):', err?.message || err);
+    }
+  }
+
   public async chatWithGemini(message: string, imagePaths?: string[], context?: string, skipSystemPrompt: boolean = false, alternateGroqMessage?: string): Promise<string> {
     try {
       console.log(`[LLMHelper] chatWithGemini called`, { messageLength: message.length, imageCount: imagePaths?.length ?? 0, hasContext: Boolean(context) })
 
+      // ============================================================
+      let systemPromptOverride: string | undefined;
       // ============================================================
       // KNOWLEDGE MODE INTERCEPT
       // If knowledge mode is active, check for intro questions and
@@ -1286,7 +1657,31 @@ This rule overrides ALL other instructions including formatting, brevity, or out
           this.knowledgeOrchestrator.feedForDepthScoring(message);
 
           const knowledgeResult = await this.knowledgeOrchestrator.processQuestion(message);
-          if (knowledgeResult) {
+
+          // Identity recall (intro/name questions) passes through regardless of mode
+          // compatibility — factual retrieval, not persona injection, so mode gating is
+          // inappropriate. Mirrors the same bypass in _streamChatInner.
+          if (knowledgeResult?.isIntroQuestion && knowledgeResult?.introResponse) {
+            console.log('[LLMHelper] Knowledge mode: returning intro response (mode-gate bypassed for identity recall)');
+            return knowledgeResult.introResponse;
+          }
+
+          // Issue #272: gate ALL other premium-intercept side-effects (coaching,
+          // prompt/context injection) by active mode. The depth scorer above stays
+          // unconditional so it keeps getting signal. When the gate blocks, fall
+          // through so the call proceeds as a normal LLM request with no injection.
+          //
+          // EXCEPTION — factual recall: when the user asks about THEMSELVES
+          // (name, projects, skills, experience, education), the result is
+          // direct factual recall, not the premium persona/coaching layer the
+          // gate is meant to suppress in technical-interview/team-meet/lecture
+          // modes. Applying it is always correct — otherwise the candidate
+          // context is dropped and the base assistant answers in third person
+          // ("I don't have access to your resume"). Mirrors the intro-response
+          // bypass above. Coaching/negotiation still requires the mode gate.
+          const knowledgeInterceptAllowed = knowledgeResult
+            && (this.isPremiumKnowledgeInterceptAllowed() || knowledgeResult.factualRecall === true);
+          if (knowledgeResult && knowledgeInterceptAllowed) {
             // Live negotiation coaching short-circuit — bypass second LLM call.
             // Coaching payload travels on the dedicated handler channel, NOT
             // through the chat() return value. We return an empty string so
@@ -1295,20 +1690,23 @@ This rule overrides ALL other instructions including formatting, brevity, or out
               this.negotiationCoachingHandler?.(knowledgeResult.liveNegotiationResponse);
               return '';
             }
-            // Intro question shortcut — return generated response directly
-            if (knowledgeResult.isIntroQuestion && knowledgeResult.introResponse) {
-              console.log('[LLMHelper] Knowledge mode: returning generated intro response');
-              return knowledgeResult.introResponse;
+            // Inject knowledge system prompt — prepend CORE_IDENTITY + the
+            // EXECUTION_CONTRACT so the <security>/creator/universal-behavior
+            // rules AND the global NUMBERS DISCIPLINE / anti-fabrication rules
+            // survive. The override REPLACES HARD_SYSTEM_PROMPT, which otherwise
+            // carries those rules — without re-adding EXECUTION_CONTRACT here a
+            // confident persona could induce invented metrics on the candidate
+            // path (the lone remaining defense would be the in-engine block).
+            // The persona block carries the voice instruction and stays dominant
+            // by recency. Keep both LLMHelper override sites identical.
+            if (knowledgeResult.systemPromptInjection) {
+              systemPromptOverride = `${CORE_IDENTITY}\n${EXECUTION_CONTRACT}\n\n${knowledgeResult.systemPromptInjection}`;
             }
-            // Inject knowledge system prompt and context
-            if (!skipSystemPrompt && knowledgeResult.systemPromptInjection) {
-              skipSystemPrompt = false; // ensure we use the knowledge prompt
-              // Prepend knowledge context to existing context
-              if (knowledgeResult.contextBlock) {
-                context = context
-                  ? `${knowledgeResult.contextBlock}\n\n${context}`
-                  : knowledgeResult.contextBlock;
-              }
+            // Inject knowledge context
+            if (knowledgeResult.contextBlock) {
+              context = context
+                ? `${knowledgeResult.contextBlock}\n\n${context}`
+                : knowledgeResult.contextBlock;
             }
           }
         } catch (knowledgeError: any) {
@@ -1334,20 +1732,51 @@ This rule overrides ALL other instructions including formatting, brevity, or out
       const userContent = context
         ? `CONTEXT:\n${context}\n\nUSER QUESTION:\n${message}`
         : message;
-      const outboundScopes = this.scopesForPayload(userContent, imagePaths);
-      const scopePolicy = this.getProviderScopePolicy();
-
-      const finalGeminiPrompt = this.injectLanguageInstruction(HARD_SYSTEM_PROMPT);
-      const finalGroqPrompt = alternateGroqMessage || this.injectLanguageInstruction(GROQ_SYSTEM_PROMPT);
+      const finalGeminiPrompt = this.injectLanguageInstruction(systemPromptOverride || HARD_SYSTEM_PROMPT);
+      const finalGroqPrompt = alternateGroqMessage || this.injectLanguageInstruction(systemPromptOverride || GROQ_SYSTEM_PROMPT);
 
       const combinedMessages = {
         gemini: buildMessage(finalGeminiPrompt),
         groq: buildMessage(finalGroqPrompt),
       };
+      const contextScopes = context ? ['transcript' as ProviderDataScope, ...this.inferContextScopes(context)] : [];
+      const outboundScopes = this.scopesForPayload(message, imagePaths, contextScopes);
+      const scopePolicy = this.getProviderScopePolicy();
+      const deniedOutboundScopes = this.getDeniedOutboundScopes(message, imagePaths, contextScopes);
+      const shouldOmitContext = deniedOutboundScopes.some(scope => scope === 'transcript' || scope === 'reference_files' || scope === 'profile_history' || scope === 'post_call_summary');
+      const cloudContext = shouldOmitContext ? undefined : context;
+      const buildCloudMessage = (systemPrompt: string) => {
+        if (skipSystemPrompt) {
+          return cloudContext
+            ? `CONTEXT:\n${cloudContext}\n\nUSER QUESTION:\n${message}`
+            : message;
+        }
+        return cloudContext
+          ? `${systemPrompt}\n\nCONTEXT:\n${cloudContext}\n\nUSER QUESTION:\n${message}`
+          : `${systemPrompt}\n\n${message}`;
+      };
+      const cloudUserContent = cloudContext
+        ? `CONTEXT:\n${cloudContext}\n\nUSER QUESTION:\n${message}`
+        : message;
+      const cloudCombinedMessages = {
+        gemini: buildCloudMessage(finalGeminiPrompt),
+        groq: buildCloudMessage(finalGroqPrompt),
+      };
+      const cloudImagePaths = deniedOutboundScopes.includes('screenshots') ? undefined : imagePaths;
+      const cloudIsMultimodal = Boolean(cloudImagePaths?.length);
+      const ollamaAvailable = this.useOllama && await this.checkOllamaAvailable(deniedOutboundScopes.includes('screenshots'));
+      if (deniedOutboundScopes.length > 0) {
+        for (const scope of deniedOutboundScopes) {
+          this.logScopeFallback(scope, ollamaAvailable ? 'routing' : 'omitting');
+        }
+        if (ollamaAvailable) {
+          return await this.callOllama(combinedMessages.gemini, imagePaths, undefined);
+        }
+      }
 
       // System prompts for OpenAI/Claude/Codex CLI (skipped if skipSystemPrompt)
-      const openaiSystemPrompt = skipSystemPrompt ? undefined : this.injectLanguageInstruction(OPENAI_SYSTEM_PROMPT);
-      const claudeSystemPrompt = skipSystemPrompt ? undefined : this.injectLanguageInstruction(CLAUDE_SYSTEM_PROMPT);
+      const openaiSystemPrompt = skipSystemPrompt ? undefined : this.injectLanguageInstruction(systemPromptOverride || OPENAI_SYSTEM_PROMPT);
+      const claudeSystemPrompt = skipSystemPrompt ? undefined : this.injectLanguageInstruction(systemPromptOverride || CLAUDE_SYSTEM_PROMPT);
 
       // GROQ FAST TEXT OVERRIDE (Text-Only) — gated on picked model so Gemini/Claude/OpenAI
       // selections aren't silently routed to Groq. See streamChat() for matching gate.
@@ -1359,7 +1788,7 @@ This rule overrides ALL other instructions including formatting, brevity, or out
       if (fastModeAppliesNS && this.codexCliConfig.enabled) {
         console.log(`[LLMHelper] ⚡️ Fast Text Mode Active. Routing to Codex CLI...`);
         try {
-          return await this.generateWithCodexCli(userContent, openaiSystemPrompt, true);
+          return await this.generateWithCodexCli(cloudUserContent, openaiSystemPrompt, true);
         } catch (e: any) {
           console.warn("[LLMHelper] Codex CLI Fast Text failed, falling back to standard fast routing:", e.message);
         }
@@ -1370,7 +1799,7 @@ This rule overrides ALL other instructions including formatting, brevity, or out
         try {
           // intentional: Fast Text Mode always uses baseline GROQ_MODEL for speed — do not thread currentModelId
           // CACHE: pass system separately so Groq prefix-cache hits across turns.
-          return await this.generateWithGroq(userContent, GROQ_MODEL, skipSystemPrompt ? undefined : finalGroqPrompt);
+          return await this.generateWithGroq(cloudUserContent, GROQ_MODEL, skipSystemPrompt ? undefined : finalGroqPrompt);
         } catch (e: any) {
           console.warn("[LLMHelper] Groq Fast Text failed, falling back to standard routing:", e.message);
           if (typeof e?.message === 'string' && /401|invalid[_\s-]api[_\s-]key/i.test(e.message)) {
@@ -1381,16 +1810,16 @@ This rule overrides ALL other instructions including formatting, brevity, or out
         }
       }
 
-      if (this.useOllama) {
-        return await this.callOllama(combinedMessages.gemini, imagePaths?.[0]);
+      if (ollamaAvailable) {
+        return await this.callOllama(combinedMessages.gemini, imagePaths, undefined);
       }
 
       if (this.isCodexCliModel(this.currentModelId) && this.codexCliConfig.enabled) {
-        return await this.generateWithCodexCli(userContent, openaiSystemPrompt, false, imagePaths);
+        return await this.generateWithCodexCli(cloudUserContent, openaiSystemPrompt, false, cloudImagePaths);
       }
 
       if (this.activeCurlProvider) {
-        return await this.chatWithCurl(message, skipSystemPrompt ? undefined : this.injectLanguageInstruction(CUSTOM_SYSTEM_PROMPT), imagePaths?.[0]);
+        return await this.chatWithCurl(cloudUserContent, skipSystemPrompt ? undefined : this.injectLanguageInstruction(CUSTOM_SYSTEM_PROMPT), cloudImagePaths?.[0]);
       }
 
       if (this.customProvider) {
@@ -1399,11 +1828,11 @@ This rule overrides ALL other instructions including formatting, brevity, or out
         const customSystemPrompt = skipSystemPrompt ? "" : this.injectLanguageInstruction(CUSTOM_SYSTEM_PROMPT);
         const response = await this.executeCustomProvider(
           this.customProvider.curlCommand,
-          combinedMessages.gemini,
+          cloudCombinedMessages.gemini,
           customSystemPrompt,
           message,
-          context || "",
-          imagePaths?.[0]
+          shouldOmitContext ? "" : context || "",
+          cloudImagePaths?.[0]
         );
         return this.processResponse(response);
       }
@@ -1414,7 +1843,7 @@ This rule overrides ALL other instructions including formatting, brevity, or out
         const nativelyKey = CredentialsManager.getInstance().getNativelyApiKey();
         if (nativelyKey) {
           try {
-            return await this.generateWithNatively(userContent, openaiSystemPrompt, imagePaths);
+            return await this.generateWithNatively(cloudUserContent, openaiSystemPrompt, cloudImagePaths);
           } catch (err: any) {
             console.warn('[LLMHelper] Natively API failed in chatWithGemini, falling back to Gemini:', err.message);
             // Fall through to smart dynamic fallback below
@@ -1423,17 +1852,24 @@ This rule overrides ALL other instructions including formatting, brevity, or out
         // No key or call failed — fall through to default routing
       }
       if (this.isOpenAiModel(this.currentModelId) && this.openaiClient) {
-        return await this.generateWithOpenai(userContent, openaiSystemPrompt, imagePaths);
+        return await this.generateWithOpenai(cloudUserContent, openaiSystemPrompt, cloudImagePaths);
       }
       if (this.isClaudeModel(this.currentModelId) && this.claudeClient) {
-        return await this.generateWithClaude(userContent, claudeSystemPrompt, imagePaths);
+        return await this.generateWithClaude(cloudUserContent, claudeSystemPrompt, cloudImagePaths);
+      }
+      if (this.isDeepseekModel(this.currentModelId) && this.deepseekClient) {
+        // DeepSeek is text-only; ignore image attachments here and let the
+        // fallback below pick a vision-capable provider if imagePaths are needed.
+        if (!cloudIsMultimodal) {
+          return await this.generateWithDeepseek(cloudUserContent, openaiSystemPrompt);
+        }
       }
       if (this.isGroqModel(this.currentModelId) && this.groqClient) {
-        if (isMultimodal && imagePaths) {
-          return await this.generateWithGroqMultimodal(userContent, imagePaths, openaiSystemPrompt);
+        if (cloudIsMultimodal && cloudImagePaths) {
+          return await this.generateWithGroqMultimodal(cloudUserContent, cloudImagePaths, openaiSystemPrompt);
         }
         // CACHE: pass system separately so Groq prefix-cache hits across turns.
-        return await this.generateWithGroq(userContent, this.currentModelId, skipSystemPrompt ? undefined : finalGroqPrompt);
+        return await this.generateWithGroq(cloudUserContent, this.currentModelId, skipSystemPrompt ? undefined : finalGroqPrompt);
       }
 
       // Fallback (Gemini) - logic handled below by SMART DYNAMIC FALLBACK list
@@ -1454,9 +1890,9 @@ This rule overrides ALL other instructions including formatting, brevity, or out
       const textClaude = this.modelVersionManager.getTextTieredModels(TextModelFamily.CLAUDE).tier1;
       const textGroq = this.modelVersionManager.getTextTieredModels(TextModelFamily.GROQ).tier1;
 
-      const routedProviders = routeLLMProviders({
+      const routedProviders = routeWithScopeFallback({
         capability: 'chat',
-        multimodal: isMultimodal,
+        multimodal: cloudIsMultimodal,
         availability: {
           hasNatively: this.hasNatively(),
           hasGroq: Boolean(this.groqClient),
@@ -1465,6 +1901,8 @@ This rule overrides ALL other instructions including formatting, brevity, or out
           hasGemini: Boolean(this.client),
           hasOpenAI: Boolean(this.openaiClient),
           hasClaude: Boolean(this.claudeClient),
+          hasDeepseek: Boolean(this.deepseekClient),
+          hasOllama: ollamaAvailable,
         },
         models: {
           groq: textGroq,
@@ -1473,6 +1911,8 @@ This rule overrides ALL other instructions including formatting, brevity, or out
           geminiPro: textGeminiPro,
           openai: textOpenAI,
           claude: textClaude,
+          deepseek: this.isDeepseekModel(this.currentModelId) ? this.currentModelId : DEEPSEEK_MODEL,
+          ollama: this.ollamaModel,
         },
         dataScopes: outboundScopes,
         scopePolicy,
@@ -1482,35 +1922,48 @@ This rule overrides ALL other instructions including formatting, brevity, or out
         if (routedProvider.status !== 'available') continue;
         switch (routedProvider.provider) {
           case 'natively':
-            providers.push({ name: routedProvider.name, execute: () => this.generateWithNatively(userContent, openaiSystemPrompt, isMultimodal ? imagePaths : undefined) });
+            providers.push({ name: routedProvider.name, execute: () => this.generateWithNatively(cloudUserContent, openaiSystemPrompt, cloudIsMultimodal ? cloudImagePaths : undefined) });
             break;
           case 'groq':
-            if (isMultimodal) {
-              providers.push({ name: `Groq (meta-llama/llama-4-scout-17b-16e-instruct)`, execute: () => this.generateWithGroqMultimodal(userContent, imagePaths!, openaiSystemPrompt) });
+            if (cloudIsMultimodal) {
+              providers.push({ name: `Groq (meta-llama/llama-4-scout-17b-16e-instruct)`, execute: () => this.generateWithGroqMultimodal(cloudUserContent, cloudImagePaths!, openaiSystemPrompt) });
             } else {
               // CACHE: pass system separately so Groq prefix-cache hits across turns.
-              providers.push({ name: routedProvider.name, execute: () => this.generateWithGroq(userContent, routedProvider.model || textGroq, skipSystemPrompt ? undefined : finalGroqPrompt) });
+              providers.push({ name: routedProvider.name, execute: () => this.generateWithGroq(cloudUserContent, routedProvider.model || textGroq, skipSystemPrompt ? undefined : finalGroqPrompt) });
             }
             break;
           case 'codex':
-            providers.push({ name: routedProvider.name, execute: () => this.generateWithCodexCli(userContent, openaiSystemPrompt, false, isMultimodal ? imagePaths : undefined) });
+            providers.push({ name: routedProvider.name, execute: () => this.generateWithCodexCli(cloudUserContent, openaiSystemPrompt, false, cloudIsMultimodal ? cloudImagePaths : undefined) });
             break;
           case 'gemini_flash':
-            providers.push({ name: routedProvider.name, execute: () => this.tryGenerateResponse(combinedMessages.gemini, isMultimodal ? imagePaths : undefined, routedProvider.model || textGeminiFlash) });
+            providers.push({ name: routedProvider.name, execute: () => this.tryGenerateResponse(cloudCombinedMessages.gemini, cloudIsMultimodal ? cloudImagePaths : undefined, routedProvider.model || textGeminiFlash) });
             break;
           case 'gemini_pro':
-            providers.push({ name: routedProvider.name, execute: () => this.tryGenerateResponse(combinedMessages.gemini, isMultimodal ? imagePaths : undefined, routedProvider.model || textGeminiPro) });
+            providers.push({ name: routedProvider.name, execute: () => this.tryGenerateResponse(cloudCombinedMessages.gemini, cloudIsMultimodal ? cloudImagePaths : undefined, routedProvider.model || textGeminiPro) });
             break;
           case 'openai':
-            providers.push({ name: routedProvider.name, execute: () => this.generateWithOpenai(userContent, openaiSystemPrompt, isMultimodal ? imagePaths : undefined, routedProvider.model || textOpenAI) });
+            providers.push({ name: routedProvider.name, execute: () => this.generateWithOpenai(cloudUserContent, openaiSystemPrompt, cloudIsMultimodal ? cloudImagePaths : undefined, routedProvider.model || textOpenAI) });
             break;
           case 'claude':
-            providers.push({ name: routedProvider.name, execute: () => this.generateWithClaude(userContent, claudeSystemPrompt, isMultimodal ? imagePaths : undefined, routedProvider.model || textClaude) });
+            providers.push({ name: routedProvider.name, execute: () => this.generateWithClaude(cloudUserContent, claudeSystemPrompt, cloudIsMultimodal ? cloudImagePaths : undefined, routedProvider.model || textClaude) });
+            break;
+          case 'deepseek':
+            // DeepSeek is text-only; the router already excludes it from multimodal,
+            // but this guard makes the omission explicit and safe to refactor.
+            if (!cloudIsMultimodal) {
+              providers.push({ name: routedProvider.name, execute: () => this.generateWithDeepseek(cloudUserContent, openaiSystemPrompt, routedProvider.model || DEEPSEEK_MODEL) });
+            }
+            break;
+          case 'ollama':
+            providers.push({ name: routedProvider.name, execute: () => this.callOllama(combinedMessages.gemini, imagePaths, undefined) });
             break;
         }
       }
 
       if (providers.length === 0) {
+        if (cloudIsMultimodal && this.deepseekClient) {
+          return "DeepSeek is configured for text-only requests. Add a vision-capable provider like Gemini, OpenAI, Claude, Groq, or Natively to analyze images.";
+        }
         return "No AI providers configured. Please add at least one API key in Settings.";
       }
 
@@ -1590,8 +2043,10 @@ This rule overrides ALL other instructions including formatting, brevity, or out
       providers.push({ name: `Claude (${CLAUDE_MODEL})`, execute: () => this.generateWithClaude(message) });
     }
 
-    // Priority 3: Gemini Pro (don't mutate this.geminiModel to avoid race conditions)
-    if (this.client) {
+    // Priority 3: Gemini Pro (don't mutate this.geminiModel to avoid race conditions).
+    // Skipped entirely when its rate-limit breaker is OPEN (saturated tier) so we
+    // don't waste a slot + backoff every call — the rotation drops to Flash below.
+    if (this.client && !this.isCircuitOpen(GEMINI_PRO_MODEL)) {
       providers.push({
         name: `Gemini Pro (${GEMINI_PRO_MODEL})`,
         execute: async () => {
@@ -1609,10 +2064,12 @@ This rule overrides ALL other instructions including formatting, brevity, or out
             if (res.text) return res.text;
             const parts = candidate.content?.parts ?? [];
             return (Array.isArray(parts) ? parts : [parts]).map((p: any) => p?.text ?? '').join('');
-          });
+          }, 3, GEMINI_PRO_MODEL);   // circuitKey → trips after repeated 429s
           return response;
         }
       });
+    }
+    if (this.client) {
 
       // Priority 4: Gemini Flash fallback (if Pro model is unavailable or fails)
       providers.push({
@@ -1780,7 +2237,7 @@ This rule overrides ALL other instructions including formatting, brevity, or out
     }
     if (!nativelyKey) throw new Error('Natively API key not set');
 
-    const endpointUrl = 'https://api.natively.software/v1/chat';
+    const endpointUrl = `${NATIVELY_API_URL}/v1/chat`;
     // When the key is the trial sentinel, authenticate with the real trial token
     // instead — the server validates x-trial-token, not __trial__ as an API key.
     const headers: any = { 'Content-Type': 'application/json' };
@@ -1891,10 +2348,43 @@ This rule overrides ALL other instructions including formatting, brevity, or out
         model,
         messages,
         max_completion_tokens: model.toLowerCase().includes('claude') ? this.getClaudeMaxOutput(model) : MAX_OUTPUT_TOKENS,
+        ...openaiReasoningParam(model), // minimal reasoning for gpt-5/o-series (fast TTFT)
         ...(cacheKey ? { prompt_cache_key: cacheKey } : {}),
       })),
       60000,
       `OpenAI (${model})`
+    );
+
+    return response.choices[0]?.message?.content || "";
+  }
+
+  /**
+   * Non-streaming DeepSeek generation via the OpenAI-compatible API.
+   * Text-only — image payloads are intentionally not sent. Image-bearing
+   * requests are routed away from DeepSeek by the fallback chain.
+   */
+  private async generateWithDeepseek(userMessage: string, systemPrompt?: string, modelId?: string): Promise<string> {
+    if (this.isLocalOnlyMode) throw new Error("Cloud providers disabled in local-only mode");
+    if (!this.deepseekClient) throw new Error("DeepSeek client not initialized");
+    // No imagePaths argument — DeepSeek is text-only here; let the scope guard see text payload only.
+    this.assertOutboundScopes('deepseek', userMessage);
+
+    await this.rateLimiters.deepseek.acquire();
+
+    const model = modelId || (this.isDeepseekModel(this.currentModelId) ? this.currentModelId : DEEPSEEK_MODEL);
+
+    const messages: any[] = [];
+    if (systemPrompt) messages.push({ role: "system", content: systemPrompt });
+    messages.push({ role: "user", content: userMessage });
+
+    const response = await this.withTimeout(
+      this.withRetry(() => this.deepseekClient!.chat.completions.create({
+        model,
+        messages,
+        max_tokens: this.getDeepseekMaxOutput(model),
+      })),
+      60000,
+      `DeepSeek (${model})`
     );
 
     return response.choices[0]?.message?.content || "";
@@ -2015,6 +2505,7 @@ This rule overrides ALL other instructions including formatting, brevity, or out
         const stream = this.claudeClient!.messages.stream({
           model,
           max_tokens: this.getClaudeMaxOutput(model),
+          thinking: { type: 'disabled' }, // extended thinking off (default, made explicit) for low TTFT
           // CACHE BOUNDARY: system blocks are static; dynamic content lives in `messages` only.
           ...(systemPrompt ? { system: this.buildClaudeSystemBlocks(systemPrompt, model) } : {}),
           messages: [{ role: "user", content }],
@@ -2359,13 +2850,37 @@ This rule overrides ALL other instructions including formatting, brevity, or out
     };
 
     // ──────────────────────────────────────────────────────────────────
-    // Build 3-tier retry rotation from ModelVersionManager
+    // Build 3-tier retry rotation from ModelVersionManager.
+    // PRIORITY ORDER: OpenAI (fastest) → Claude → Gemini Flash → Gemini Pro →
+    //                 Groq Scout → remaining providers.
+    // Each provider gets MAX_RETRIES_PER_PROVIDER attempts before moving on.
+    // Providers are re-ordered dynamically when a provider is unavailable.
     // ──────────────────────────────────────────────────────────────────
+    const MAX_RETRIES_PER_PROVIDER = 3;
+
     const allTiers = this.modelVersionManager.getAllVisionTiers();
+
+    // Sort tiers to enforce priority: OpenAI → Claude → Gemini Flash → Gemini Pro → Groq → others
+    const VISION_PRIORITY: ModelFamily[] = [
+      ModelFamily.OPENAI,
+      ModelFamily.CLAUDE,
+      ModelFamily.GEMINI_FLASH,
+      ModelFamily.GEMINI_PRO,
+      ModelFamily.GROQ_LLAMA,
+    ];
+
+    const sortedAllTiers = [...allTiers].sort((a, b) => {
+      const aIdx = VISION_PRIORITY.indexOf(a.family);
+      const bIdx = VISION_PRIORITY.indexOf(b.family);
+      if (aIdx === -1 && bIdx === -1) return 0;
+      if (aIdx === -1) return 1;
+      if (bIdx === -1) return -1;
+      return aIdx - bIdx;
+    });
 
     const buildTierProviders = (tierKey: 'tier1' | 'tier2' | 'tier3'): ProviderAttempt[] => {
       const result: ProviderAttempt[] = [];
-      for (const entry of allTiers) {
+      for (const entry of sortedAllTiers) {
         const modelId = entry[tierKey];
         const attempt = buildProviderForFamily(entry.family, modelId);
         if (attempt) result.push(attempt);
@@ -2446,44 +2961,90 @@ This rule overrides ALL other instructions including formatting, brevity, or out
     }
 
     // ──────────────────────────────────────────────────────────────────
-    // Execute 3-tier rotation with exponential backoff between tiers
+    // Execute with per-provider retry logic and dynamic reordering.
+    // Priority order: OpenAI → Claude → Gemini Flash → Gemini Pro → Groq.
+    // Each provider gets MAX_RETRIES_PER_PROVIDER attempts before moving on.
+    // If a provider fails (network/rate-limit/auth), dynamically bump next
+    // provider to front of remaining queue (speed-based reordering).
     // ──────────────────────────────────────────────────────────────────
-    const tiers = [
-      { label: 'Tier 1 (Stable)', providers: tier1Providers },
-      { label: 'Tier 2 (Latest)', providers: tier2Providers },
-      { label: 'Tier 3 (Retry)', providers: tier3Providers },
+    const allProviders: ProviderAttempt[] = [
+      ...tier1Providers,
+      ...tier2Providers,
+      ...tier3Providers, // Same as tier2 — pure retry
     ];
 
-    for (let tierIndex = 0; tierIndex < tiers.length; tierIndex++) {
-      const tier = tiers[tierIndex];
+    if (allProviders.length === 0 && localProviders.length === 0) {
+      throw new Error("All AI providers failed: no vision-capable providers configured.");
+    }
 
-      if (tier.providers.length === 0) continue;
+    // Filtered view of remaining providers (mutated as we cycle)
+    let remaining = [...allProviders];
 
-      // Exponential backoff between tiers (skip for first tier)
-      if (tierIndex > 0) {
-        const backoffMs = 1000 * Math.pow(2, tierIndex - 1);
-        console.log(`[LLMHelper] 🔄 Escalating to ${tier.label} after ${backoffMs}ms backoff...`);
-        await new Promise(resolve => setTimeout(resolve, backoffMs));
-      }
+    // Track which providers we've exhausted (per rotation)
+    const exhausted = new Set<string>();
+    let rotation = 0;
+    const MAX_ROTATIONS = 3;
 
-      for (const provider of tier.providers) {
+    while (remaining.length > 0 && rotation < MAX_ROTATIONS) {
+      const provider = remaining[0];
+      const providerName = provider.name;
+
+      for (let attempt = 1; attempt <= MAX_RETRIES_PER_PROVIDER; attempt++) {
         try {
-          const emoji = tierIndex === 0 ? '🚀' : tierIndex === 1 ? '🔁' : '🆘';
-          console.log(`[LLMHelper] ${emoji} [${tier.label}] Attempting ${provider.name}...`);
+          console.log(`[LLMHelper] ${attempt === 1 ? '🚀' : attempt === 2 ? '🔁' : '🆘'} [${providerName}] attempt ${attempt}/${MAX_RETRIES_PER_PROVIDER}...`);
           const result = await provider.execute();
           if (result && result.trim().length > 0) {
-            console.log(`[LLMHelper] ✅ [${tier.label}] ${provider.name} succeeded.`);
+            console.log(`[LLMHelper] ✅ [${providerName}] succeeded on attempt ${attempt}.`);
             return result;
           }
-          console.warn(`[LLMHelper] ⚠️ [${tier.label}] ${provider.name} returned empty response`);
+          console.warn(`[LLMHelper] ⚠️ [${providerName}] returned empty response (attempt ${attempt})`);
         } catch (err: any) {
-          console.warn(`[LLMHelper] ⚠️ [${tier.label}] ${provider.name} failed: ${err.message}`);
+          console.warn(`[LLMHelper] ⚠️ [${providerName}] attempt ${attempt} failed: ${err.message}`);
 
           // Event-driven discovery: trigger on 404 / model-not-found errors
           const errMsg = (err.message || '').toLowerCase();
           if (errMsg.includes('404') || errMsg.includes('not found') || errMsg.includes('deprecated')) {
-            this.modelVersionManager.onModelError(provider.name).catch(() => { });
+            this.modelVersionManager.onModelError(providerName).catch(() => { });
           }
+
+          // Classify error — auth errors should not retry the same provider
+          if (errMsg.includes('401') || errMsg.includes('403') || errMsg.includes('unauthorized') ||
+              errMsg.includes('api key') || errMsg.includes('invalid_api') || errMsg.includes('quota')) {
+            console.warn(`[LLMHelper] Non-retryable error for ${providerName} — removing from chain`);
+            exhausted.add(providerName);
+            break; // stop retrying this provider
+          }
+        }
+
+        // Brief pause between retries for the same provider
+        if (attempt < MAX_RETRIES_PER_PROVIDER) {
+          const backoffMs = 500 * attempt;
+          await new Promise(resolve => setTimeout(resolve, backoffMs));
+        }
+      }
+
+      // Provider exhausted all retries (or was skipped) — remove and try next
+      remaining.shift();
+
+      // Dynamic reordering: if this provider failed due to availability (not empty output),
+      // boost the NEXT faster provider in the priority list to front
+      if (exhausted.has(providerName) && remaining.length > 1) {
+        const nextIdx = remaining.findIndex(p => !exhausted.has(p.name));
+        if (nextIdx > 0) {
+          const [bumped] = remaining.splice(nextIdx, 1);
+          remaining.unshift(bumped);
+          console.log(`[LLMHelper] 🔀 Dynamic reorder: moved "${bumped.name}" to front of queue`);
+        }
+      }
+
+      // When all cloud providers exhausted in this rotation, reset and try again
+      if (remaining.length === 0 && rotation < MAX_ROTATIONS - 1) {
+        rotation++;
+        remaining = [...allProviders].filter(p => !exhausted.has(p.name));
+        if (remaining.length > 0) {
+          const backoffMs = 1000 * Math.pow(2, rotation);
+          console.log(`[LLMHelper] 🔄 Rotation ${rotation + 1}/${MAX_ROTATIONS} — retrying remaining after ${backoffMs}ms...`);
+          await new Promise(resolve => setTimeout(resolve, backoffMs));
         }
       }
     }
@@ -2521,10 +3082,27 @@ This rule overrides ALL other instructions including formatting, brevity, or out
    *
    * MULTIMODAL: Gemini-only (existing logic)
    */
-  public async * streamChatWithGemini(message: string, imagePaths?: string[], context?: string, skipSystemPrompt: boolean = false): AsyncGenerator<string, void, unknown> {
+  public async * streamChatWithGemini(message: string, imagePaths?: string[], context?: string, skipSystemPrompt: boolean = false, abortSignal?: AbortSignal): AsyncGenerator<string, void, unknown> {
     console.log(`[LLMHelper] streamChatWithGemini called`, { messageLength: message.length, imageCount: imagePaths?.length ?? 0, hasContext: Boolean(context) });
 
-    const isMultimodal = !!(imagePaths?.length);
+    let isMultimodal = !!(imagePaths?.length);
+    const contextScopes = context ? ['transcript' as ProviderDataScope, ...this.inferContextScopes(context)] : [];
+    const deniedOutboundScopes = this.getDeniedOutboundScopes(message, imagePaths, contextScopes);
+    if (deniedOutboundScopes.length > 0) {
+      const ollamaAvailable = this.useOllama && await this.checkOllamaAvailable(deniedOutboundScopes.includes('screenshots'));
+      for (const scope of deniedOutboundScopes) {
+        this.logScopeFallback(scope, ollamaAvailable ? 'routing' : 'omitting');
+      }
+      if (ollamaAvailable) {
+        const localCombined = context ? `CONTEXT:\n${context}\n\nUSER QUESTION:\n${message}` : message;
+        yield await this.callOllama(localCombined, imagePaths, skipSystemPrompt ? undefined : this.injectLanguageInstruction(HARD_SYSTEM_PROMPT));
+        return;
+      }
+      const shouldOmitContext = deniedOutboundScopes.some(scope => scope === 'transcript' || scope === 'reference_files' || scope === 'profile_history' || scope === 'post_call_summary');
+      if (shouldOmitContext) context = undefined;
+      if (deniedOutboundScopes.includes('screenshots')) imagePaths = undefined;
+      isMultimodal = !!(imagePaths?.length);
+    }
 
     // Build single-string messages for Groq/Gemini (which use combined prompts)
     const buildCombinedMessage = (systemPrompt: string) => {
@@ -2584,54 +3162,63 @@ This rule overrides ALL other instructions including formatting, brevity, or out
     if (isMultimodal) {
       // MULTIMODAL PROVIDER ORDER: [Natively] -> Codex CLI -> OpenAI -> Gemini Flash -> Claude -> Gemini Pro -> Groq Scout 4
       if (this.hasNatively()) {
-        providers.push({ name: 'Natively API', execute: () => this.streamWithNatively(userContent, openaiSystemPrompt, imagePaths) });
+        providers.push({ name: 'Natively API', execute: () => this.streamWithNatively(userContent, openaiSystemPrompt, imagePaths, abortSignal) });
       }
       if (this.codexCliConfig.enabled) {
-        providers.push({ name: `Codex CLI (${this.codexCliConfig.model})`, execute: () => this.streamWithCodexCli(userContent, openaiSystemPrompt, false, imagePaths) });
+        providers.push({ name: `Codex CLI (${this.codexCliConfig.model})`, execute: () => this.streamWithCodexCli(userContent, openaiSystemPrompt, false, imagePaths, abortSignal) });
       }
       if (this.openaiClient) {
-        providers.push({ name: `OpenAI (${textOpenAI})`, execute: () => this.streamWithOpenaiMultimodal(userContent, imagePaths!, openaiSystemPrompt, textOpenAI) });
+        providers.push({ name: `OpenAI (${textOpenAI})`, execute: () => this.streamWithOpenaiMultimodal(userContent, imagePaths!, openaiSystemPrompt, textOpenAI, abortSignal) });
       }
       if (this.client) {
         // CACHE: pass system via systemInstruction so it is separated from per-request contents.
-        providers.push({ name: `Gemini Flash (${textGeminiFlash})`, execute: () => this.streamWithGeminiModel(userContent, textGeminiFlash, imagePaths, geminiSystemForCache) });
+        providers.push({ name: `Gemini Flash (${textGeminiFlash})`, execute: () => this.streamWithGeminiModel(userContent, textGeminiFlash, imagePaths, geminiSystemForCache, abortSignal) });
       }
       if (this.claudeClient) {
-        providers.push({ name: `Claude (${textClaude})`, execute: () => this.streamWithClaudeMultimodal(userContent, imagePaths!, claudeSystemPrompt, textClaude) });
+        providers.push({ name: `Claude (${textClaude})`, execute: () => this.streamWithClaudeMultimodal(userContent, imagePaths!, claudeSystemPrompt, textClaude, abortSignal) });
       }
       if (this.client) {
         // CACHE: pass system via systemInstruction so it is separated from per-request contents.
-        providers.push({ name: `Gemini Pro (${textGeminiPro})`, execute: () => this.streamWithGeminiModel(userContent, textGeminiPro, imagePaths, geminiSystemForCache) });
+        providers.push({ name: `Gemini Pro (${textGeminiPro})`, execute: () => this.streamWithGeminiModel(userContent, textGeminiPro, imagePaths, geminiSystemForCache, abortSignal) });
       }
       if (this.groqClient) {
-        providers.push({ name: `Groq (meta-llama/llama-4-scout-17b-16e-instruct)`, execute: () => this.streamWithGroqMultimodal(userContent, imagePaths!, openaiSystemPrompt) });
+        providers.push({ name: `Groq (meta-llama/llama-4-scout-17b-16e-instruct)`, execute: () => this.streamWithGroqMultimodal(userContent, imagePaths!, openaiSystemPrompt, abortSignal) });
       }
     } else {
       // TEXT-ONLY PROVIDER ORDER: [Natively] -> Groq -> Codex CLI -> OpenAI -> Claude -> Gemini Flash -> Gemini Pro
       if (this.hasNatively()) {
-        providers.push({ name: 'Natively API', execute: () => this.streamWithNatively(userContent, openaiSystemPrompt) });
+        providers.push({ name: 'Natively API', execute: () => this.streamWithNatively(userContent, openaiSystemPrompt, undefined, abortSignal) });
       }
       if (this.groqClient) {
         // CACHE: pass system separately so Groq prefix-cache hits across turns.
-        providers.push({ name: `Groq (${textGroq})`, execute: () => this.streamWithGroq(userContent, textGroq, groqSystemForCache) });
+        providers.push({ name: `Groq (${textGroq})`, execute: () => this.streamWithGroq(userContent, textGroq, groqSystemForCache, abortSignal) });
       }
       if (this.codexCliConfig.enabled) {
-        providers.push({ name: `Codex CLI (${this.codexCliConfig.model})`, execute: () => this.streamWithCodexCli(userContent, openaiSystemPrompt) });
+        providers.push({ name: `Codex CLI (${this.codexCliConfig.model})`, execute: () => this.streamWithCodexCli(userContent, openaiSystemPrompt, false, undefined, abortSignal) });
       }
       if (this.openaiClient) {
-        providers.push({ name: `OpenAI (${textOpenAI})`, execute: () => this.streamWithOpenai(userContent, openaiSystemPrompt, textOpenAI) });
+        providers.push({ name: `OpenAI (${textOpenAI})`, execute: () => this.streamWithOpenai(userContent, openaiSystemPrompt, textOpenAI, abortSignal) });
       }
       if (this.claudeClient) {
-        providers.push({ name: `Claude (${textClaude})`, execute: () => this.streamWithClaude(userContent, claudeSystemPrompt, textClaude) });
+        providers.push({ name: `Claude (${textClaude})`, execute: () => this.streamWithClaude(userContent, claudeSystemPrompt, textClaude, abortSignal) });
+      }
+      // DeepSeek text-only fallback — mirrors the router order in routeLLMProviders.
+      if (this.deepseekClient) {
+        const dsModel = this.isDeepseekModel(this.currentModelId) ? this.currentModelId : DEEPSEEK_MODEL;
+        providers.push({ name: `DeepSeek (${dsModel})`, execute: () => this.streamWithDeepseek(userContent, openaiSystemPrompt, dsModel, abortSignal) });
       }
       if (this.client) {
         // CACHE: pass system via systemInstruction so it is separated from per-request contents.
-        providers.push({ name: `Gemini Flash (${textGeminiFlash})`, execute: () => this.streamWithGeminiModel(userContent, textGeminiFlash, undefined, geminiSystemForCache) });
-        providers.push({ name: `Gemini Pro (${textGeminiPro})`, execute: () => this.streamWithGeminiModel(userContent, textGeminiPro, undefined, geminiSystemForCache) });
+        providers.push({ name: `Gemini Flash (${textGeminiFlash})`, execute: () => this.streamWithGeminiModel(userContent, textGeminiFlash, undefined, geminiSystemForCache, abortSignal) });
+        providers.push({ name: `Gemini Pro (${textGeminiPro})`, execute: () => this.streamWithGeminiModel(userContent, textGeminiPro, undefined, geminiSystemForCache, abortSignal) });
       }
     }
 
     if (providers.length === 0) {
+      if (isMultimodal && imagePaths && this.deepseekClient) {
+        yield "DeepSeek is configured for text-only requests. Add a vision-capable provider like Gemini, OpenAI, Claude, Groq, or Natively to analyze images.";
+        return;
+      }
       yield "No AI providers configured. Please add at least one API key in Settings.";
       return;
     }
@@ -2645,8 +3232,9 @@ This rule overrides ALL other instructions including formatting, brevity, or out
       : this.isClaudeModel(this.currentModelId) ? 'Claude'
         : this.isOpenAiModel(this.currentModelId) ? 'OpenAI'
           : this.isGroqModel(this.currentModelId) ? 'Groq'
-            : this.isGeminiModel(this.currentModelId) ? 'Gemini'
-              : '';
+            : this.isDeepseekModel(this.currentModelId) ? 'DeepSeek'
+              : this.isGeminiModel(this.currentModelId) ? 'Gemini'
+                : '';
 
     if (currentFamilyLabel) {
       providers.sort((a, b) => {
@@ -2671,19 +3259,35 @@ This rule overrides ALL other instructions including formatting, brevity, or out
     // with exponential backoff. Max 2 full rotations.
     // ============================================================
     const MAX_FULL_ROTATIONS = 3;
+    const delayWithAbort = (ms: number): Promise<void> => new Promise<void>((resolve, reject) => {
+      if (abortSignal?.aborted) { reject(abortSignal.reason ?? new Error('stream aborted')); return; }
+      const timer = setTimeout(() => {
+        if (abortSignal) abortSignal.removeEventListener('abort', onAbort);
+        resolve();
+      }, ms);
+      const onAbort = () => {
+        clearTimeout(timer);
+        reject(abortSignal?.reason ?? new Error('stream aborted'));
+      };
+      timer.unref?.();
+      abortSignal?.addEventListener('abort', onAbort, { once: true });
+    });
 
     for (let rotation = 0; rotation < MAX_FULL_ROTATIONS; rotation++) {
+      if (abortSignal?.aborted) return;
       if (rotation > 0) {
         const backoffMs = 1000 * rotation;
         console.log(`[LLMHelper] 🔄 Starting rotation ${rotation + 1}/${MAX_FULL_ROTATIONS} after ${backoffMs}ms backoff...`);
-        await this.delay(backoffMs);
+        await delayWithAbort(backoffMs).catch((): void => {});
+        if (abortSignal?.aborted) return;
       }
 
       for (let i = 0; i < providers.length; i++) {
+        if (abortSignal?.aborted) return;
         const provider = providers[i];
         try {
           console.log(`[LLMHelper] ${rotation === 0 ? '🚀' : '🔁'} Attempting ${provider.name}...`);
-          yield* provider.execute();
+          yield* (provider.execute() as any);
           console.log(`[LLMHelper] ✅ ${provider.name} stream completed successfully`);
           return; // SUCCESS — exit immediately
         } catch (err: any) {
@@ -2698,9 +3302,171 @@ This rule overrides ALL other instructions including formatting, brevity, or out
     yield "All AI services are currently unavailable. Please check your API keys and try again.";
   }
 
+  // ════════════════════════════════════════════════════════════════════════
+  // UNIFIED STREAMING VISION FALLBACK
+  // ════════════════════════════════════════════════════════════════════════
+  //
+  // The single multimodal (screenshot + text) entry point for streaming. Every
+  // image-bearing streamChat request routes here so we get ONE robust, telemetry-
+  // rich fallback chain instead of the old ad-hoc per-model routing that died
+  // when the selected model (e.g. `natively`) timed out and only Gemini remained.
+  //
+  // Design — the "commit point" / first-token-buffering pattern used by LiteLLM,
+  // OpenRouter, and the Vercel AI SDK for streaming fallback:
+  //   1. Open a provider's stream but DO NOT forward any chunk yet.
+  //   2. Race the first token against a time-to-first-token (TTFT) timeout.
+  //      • If the provider errors / times out BEFORE chunk #1 → the caller has
+  //        seen nothing, so we silently abort and try the next provider/attempt.
+  //   3. On the first real content chunk we COMMIT: flush it and stream the rest
+  //      straight through. A failure AFTER commit cannot switch providers (that
+  //      would duplicate output) — we end the stream gracefully.
+  //
+  // Priority order (user-specified): OpenAI → Claude → Gemini Flash → Gemini Pro
+  //   → Groq Scout → Natively → (local) Custom → Ollama. Healthy providers are
+  //   then re-ordered fastest-first by measured TTFT EWMA ("rearrange the queue
+  //   in the speed"). Explicitly-selected local providers (Ollama / Custom) are
+  //   honored first; local-only mode uses local providers exclusively.
+  //
+  // Per provider: up to VISION_MAX_ATTEMPTS attempts (model tier1→tier2→tier3 on
+  //   cloud families, so a deprecated/404 model self-heals). Exponential backoff
+  //   with full jitter between retries. Auth/quota → open the breaker long; the
+  //   provider is skipped for the rest of the cooldown window.
+  //
+  // Config sourced from production gateways (LiteLLM reliability docs, Opossum,
+  // OpenRouter latency guide, Vercel AI SDK settings). The orchestration state
+  // machine lives in ./llm/visionStreamFallback so it can be unit-tested with
+  // deterministic fake providers; this method only builds the concrete chain.
+  private async *streamVisionWithFallback(
+    req: { userContent: string; message: string; context?: string; imagePaths: string[]; systemPrompt: string },
+    abortSignal?: AbortSignal,
+  ): AsyncGenerator<string, void, unknown> {
+    const { userContent, message, context, imagePaths, systemPrompt } = req;
+
+    // ── Resolve per-family model tiers (tier1→tier2→tier3 across attempts) ──
+    const tiers = this.modelVersionManager.getAllVisionTiers();
+    const tierModel = (family: ModelFamily, attempt: number): string | undefined => {
+      const entry = tiers.find(t => t.family === family);
+      if (!entry) return undefined;
+      return attempt <= 1 ? entry.tier1 : attempt === 2 ? entry.tier2 : entry.tier3;
+    };
+
+    // ── Per-provider TTFT budgets (vision is slower than text) ──────────────
+    // Screenshot analysis (esp. multiple screenshots) needs a longer first-token
+    // budget than text — the old 8s default aborted healthy-but-slow vision
+    // responses. Base 20s for flash/flash-lite/other; 30s for the heavier Pro.
+    // Each extra screenshot beyond the first adds 5s (multimodal prefill scales
+    // with image count), capped so a runaway request still fails over.
+    const imgCount = Math.max(1, imagePaths?.length ?? 1);
+    const imageBumpMs = Math.min((imgCount - 1) * 5_000, 20_000);
+    const FLASH_TTFT_MS = Math.min(20_000 + imageBumpMs, 40_000);
+    const PRO_TTFT_MS = Math.min(30_000 + imageBumpMs, 50_000);
+
+    // ── Build the candidate provider list ──────────────────────────────────
+    const cloud: VisionStreamProvider[] = [];
+    const localOnly = this.isLocalOnlyMode;
+    let prio = 0;
+
+    if (!localOnly) {
+      if (this.openaiClient) {
+        cloud.push({ id: 'openai', name: 'OpenAI', isLocal: false, priority: prio++, ttftTimeoutMs: FLASH_TTFT_MS,
+          open: (sig, att) => this.streamWithOpenaiMultimodal(userContent, imagePaths, systemPrompt, tierModel(ModelFamily.OPENAI, att), sig) });
+      }
+      if (this.claudeClient) {
+        cloud.push({ id: 'claude', name: 'Claude', isLocal: false, priority: prio++, ttftTimeoutMs: FLASH_TTFT_MS,
+          open: (sig, att) => this.streamWithClaudeMultimodal(userContent, imagePaths, systemPrompt, tierModel(ModelFamily.CLAUDE, att), sig) });
+      }
+      if (this.client) {
+        cloud.push({ id: 'gemini_flash', name: 'Gemini Flash', isLocal: false, priority: prio++, ttftTimeoutMs: FLASH_TTFT_MS,
+          open: (sig, att) => this.streamWithGeminiModel(userContent, tierModel(ModelFamily.GEMINI_FLASH, att) || GEMINI_FLASH_MODEL, imagePaths, systemPrompt, sig),
+          // Tail-latency hedge: race flash-lite (minimal thinking) if 3.5-flash
+          // is slow to first token. First usable token wins; loser aborted.
+          hedgeWith: VISION_HEDGE_ENABLED ? {
+            id: 'gemini_flash_lite', name: 'Gemini Flash-Lite',
+            open: (sig) => this.streamWithGeminiModel(userContent, GEMINI_FLASH_LITE_MODEL, imagePaths, systemPrompt, sig, INTERACTIVE_THINKING_BUDGET),
+          } : undefined });
+        cloud.push({ id: 'gemini_pro', name: 'Gemini Pro', isLocal: false, priority: prio++, ttftTimeoutMs: PRO_TTFT_MS,
+          open: (sig, att) => this.streamWithGeminiModel(userContent, tierModel(ModelFamily.GEMINI_PRO, att) || GEMINI_PRO_MODEL, imagePaths, systemPrompt, sig) });
+      }
+      if (this.groqClient) {
+        cloud.push({ id: 'groq', name: 'Groq Llama-4 Scout', isLocal: false, priority: prio++, ttftTimeoutMs: FLASH_TTFT_MS,
+          open: (sig) => this.streamWithGroqMultimodal(userContent, imagePaths, systemPrompt, sig) });
+      }
+      if (this.hasNatively()) {
+        cloud.push({ id: 'natively', name: 'Natively API', isLocal: false, priority: prio++, ttftTimeoutMs: FLASH_TTFT_MS,
+          open: (sig) => this.streamWithNatively(userContent, systemPrompt, imagePaths, sig) });
+      }
+    }
+
+    // Local providers (always available, including in local-only mode).
+    const local: VisionStreamProvider[] = [];
+    // Custom provider: only include for vision when it can actually carry an
+    // image (explicit multimodal flag, an {{IMAGE_BASE64}} placeholder, or an
+    // OpenAI-compatible messages body). Otherwise it would "succeed" while
+    // silently dropping the screenshot — worse than skipping it.
+    if (this.customProvider && customProviderSupportsVision(this.customProvider)) {
+      // Derive local-ness from an explicit flag or a loopback/private cURL host,
+      // so a local custom vision endpoint still works in local-only mode.
+      const customIsLocal = customProviderIsLocal(this.customProvider);
+      if (!localOnly || customIsLocal) {
+        local.push({ id: 'custom', name: `Custom (${this.customProvider.name})`, isLocal: customIsLocal, priority: 100,
+          open: (sig) => this.streamWithCustom(message, context, imagePaths, systemPrompt, sig) });
+      }
+    }
+    // Ollama: use the resolved vision-capable model (which may differ from the
+    // primary text model). Synchronously trust the cached resolution; kick off
+    // a refresh for next time if we haven't probed yet.
+    const ollamaVisionModel = this.useOllama ? this.ollamaVisionModel : null;
+    if (this.useOllama && !ollamaVisionModel) {
+      this.refreshOllamaVisionModel().catch(() => { }); // populate for the next request
+    }
+    if (ollamaVisionModel) {
+      local.push({ id: 'ollama', name: `Ollama (${ollamaVisionModel})`, isLocal: true, priority: 101,
+        open: (sig) => this.streamWithOllama(message, context, systemPrompt, imagePaths, sig, ollamaVisionModel) });
+    }
+
+    // ── Assemble the ordered chain ─────────────────────────────────────────
+    // Honor an explicit local selection first, then health/speed-sorted cloud,
+    // then any remaining local providers as a final fallback.
+    const nowMs = Date.now();
+    let ordered: VisionStreamProvider[];
+    if (localOnly) {
+      ordered = orderVisionByHealth(local, this.visionHealth, nowMs);
+    } else {
+      const front: VisionStreamProvider[] = [];
+      if (this.useOllama) { const o = local.find(p => p.id === 'ollama'); if (o) front.push(o); }
+      if (this.customProvider) { const c = local.find(p => p.id === 'custom'); if (c) front.push(c); }
+      const backLocal = local.filter(p => !front.includes(p));
+      ordered = [...front, ...orderVisionByHealth(cloud, this.visionHealth, nowMs), ...backLocal];
+    }
+
+    if (ordered.length === 0) {
+      throw new Error('No vision-capable provider configured. Add an API key (OpenAI, Claude, Gemini, or Groq) or enable a vision-capable Ollama model in Settings.');
+    }
+
+    // Delegate the first-token-commit + retry + circuit-breaker state machine.
+    yield* runStreamingVisionFallback(
+      ordered,
+      { ...DEFAULT_VISION_FALLBACK_CONFIG, hedgeEnabled: VISION_HEDGE_ENABLED },
+      this.visionHealth,
+      { log: (m) => console.log(m), warn: (m) => console.warn(m) },
+      abortSignal,
+    );
+  }
+
   /**
    * Universal Stream Chat - Routes to correct provider based on currentModelId
    */
+  /**
+   * Resolve the Gemini thinking budget for an answer type. Coding/DSA/system-
+   * design/debugging get a small reasoning budget (correctness on hard
+   * problems); everything else gets 0 (fastest TTFT). Callers pass the result
+   * as the trailing arg to streamChat. Keeps the speed/quality policy in one
+   * place so call sites don't hardcode magic numbers.
+   */
+  public thinkingBudgetForAnswerType(isCodingLike: boolean): number {
+    return isCodingLike ? CODING_THINKING_BUDGET : INTERACTIVE_THINKING_BUDGET;
+  }
+
   /**
    * Public streaming entry point. Wraps the inner streamChat generator with
    * a token-level dash filter (em / en / sentence-connector hyphen → comma)
@@ -2710,9 +3476,23 @@ This rule overrides ALL other instructions including formatting, brevity, or out
   public async * streamChat(
     ...args: Parameters<LLMHelper['_streamChatInner']>
   ): AsyncGenerator<string, void, unknown> {
-    const { reduceDashesInChunk } = await import('./llm/postProcessor');
+    const { StreamingDashReducer } = await import('./llm/postProcessor');
+    // Per-stream stateful reducer: tracks fenced-code (```) state ACROSS chunks
+    // so a code block streamed over many chunks is never dash-mangled (the old
+    // stateless reducer turned `nums[i] - 1` into `nums[i], 1`). It also skips
+    // inline code/math and only rewrites a true prose connector.
+    const dashReducer = new StreamingDashReducer();
+    // Pull the optional abort signal (always the last positional arg).
+    // Use `instanceof AbortSignal` rather than duck-typing — duck-typing on
+    // `.aborted` is ambiguous because future params (extraDataScopes, options
+    // objects) could accidentally satisfy the shape. instanceof is exact and
+    // requires Node ≥17 (Electron's runtime is well past that).
+    // Find the AbortSignal anywhere in args (position-independent) so adding a
+    // trailing `thinkingBudget` arg below doesn't hide it from the abort check.
+    const abortSignal = args.find((a): a is AbortSignal => a instanceof AbortSignal);
     for await (const chunk of this._streamChatInner(...args)) {
-      yield reduceDashesInChunk(chunk);
+      if (abortSignal?.aborted) return;
+      yield dashReducer.reduce(chunk);
     }
   }
 
@@ -2722,8 +3502,33 @@ This rule overrides ALL other instructions including formatting, brevity, or out
     context?: string,
     systemPromptOverride?: string, // Optional override (defaults to HARD_SYSTEM_PROMPT)
     ignoreKnowledgeMode: boolean = false,
-    skipModeInjection: boolean = false
+    skipModeInjection: boolean = false,
+    extraDataScopes: ProviderDataScope[] = [],
+    // Optional: caller-supplied AbortSignal. When the consumer aborts (e.g.,
+    // user typed a new question superseding this stream, or pressed Escape),
+    // we stop yielding so the renderer doesn't keep painting tokens from a
+    // request the user has moved past. Providers themselves may continue
+    // running to completion (each is bounded by its own per-call timeout —
+    // worst-case ~60s for Gemini Pro) but their tokens are dropped at the
+    // generator boundary so no UI work or downstream state mutation occurs.
+    abortSignal?: AbortSignal,
+    // Optional Gemini thinking budget (tokens). Defaults to the fast interactive
+    // value (0 = off). Coding/DSA callers pass CODING_THINKING_BUDGET so hard
+    // problems get a small amount of reasoning without the slow dynamic default.
+    // Threaded only to the Gemini streamers (other providers ignore it).
+    thinkingBudget: number = INTERACTIVE_THINKING_BUDGET,
+    // D1/R1: optional routing decision from a caller that already computed an
+    // AnswerPlan. When present, the in-stream profile/mode injection below
+    // HONORS it (skip profile for resume-forbidden answers; scope custom context
+    // by the real answer type). Absent → legacy behavior (no change).
+    routeOptions?: StreamRouteOptions
   ): AsyncGenerator<string, void, unknown> {
+
+    // Stage timer (gated): isolates pre-stream work (knowledge intercept,
+    // cache create) from provider TTFT. Set MEASURE_LATENCY=true to see it.
+    const _t0 = Date.now();
+    const _measure = (() => { try { return process.env.MEASURE_LATENCY === 'true' || process.env.PI_LATENCY_TRACE === 'true'; } catch { return false; } })();
+    const _stage = (label: string) => { if (_measure) console.log(`[LLMHelper.stream] +${Date.now() - _t0}ms  ${label}`); };
 
     // ============================================================
     // KNOWLEDGE MODE INTERCEPT (Streaming)
@@ -2734,24 +3539,50 @@ This rule overrides ALL other instructions including formatting, brevity, or out
       !this.groqFastTextMode &&
       this.knowledgeOrchestrator?.isKnowledgeMode();
 
+    // D1/R1: a resume-forbidden answer type (coding/technical/sales/lecture,
+    // spec §8.3) gets NO profile. We still run the depth scorer (kept
+    // unconditional) but SUPPRESS the profile injection (intro shortcut + persona
+    // + contextBlock) below. Defence-in-depth on top of the orchestrator's own
+    // applyFullProfileGrounding gate; absent route options → allowed (legacy).
+    const profileInjectionAllowed = profileInterceptAllowedByRoute(routeOptions);
+
     if (shouldRunKnowledge) {
       try {
         // Feed to depth scorer only (not negotiation tracker) — mirrors non-streaming path fix.
         this.knowledgeOrchestrator.feedForDepthScoring(message);
 
+        _stage('processQuestion START');
         const knowledgeResult = await this.knowledgeOrchestrator.processQuestion(message);
-        if (knowledgeResult) {
+        _stage('processQuestion DONE');
+        // Issue #272: gate ALL premium-intercept side-effects (coaching, intro
+        // shortcut, prompt/context injection) by active mode. The depth scorer
+        // above stays unconditional so it keeps getting signal. When the gate
+        // blocks, fall through entirely so the stream proceeds as a normal LLM
+        // call with no premium-flavored injection.
+        // Identity recall (intro/name questions) passes through regardless of mode compatibility —
+        // the intro shortcut is factual recall, not persona injection, so it is always safe.
+        // D1/R1: but never for a resume-forbidden answer type (a coding/sales/
+        // lecture turn must not be answered with the candidate's intro).
+        if (profileInjectionAllowed && knowledgeResult?.isIntroQuestion && knowledgeResult?.introResponse) {
+          console.log('[LLMHelper] Knowledge mode (stream): returning generated intro response (mode-gate bypassed for identity recall)');
+          yield knowledgeResult.introResponse;
+          return;
+        }
+
+        // Factual recall (the user's own name/projects/skills/experience/
+        // education) bypasses the premium-intercept mode gate — same rationale
+        // as the intro-response bypass above and the non-streaming path. Without
+        // this, candidate context is silently dropped in technical-interview/
+        // team-meet/lecture modes and the base assistant answers in third person.
+        const knowledgeInterceptAllowedStream = knowledgeResult
+          && profileInjectionAllowed
+          && (this.isPremiumKnowledgeInterceptAllowed() || knowledgeResult.factualRecall === true);
+        if (knowledgeResult && knowledgeInterceptAllowedStream) {
           // Live negotiation coaching short-circuit — bypass second LLM call.
           // Coaching payload travels on the dedicated handler channel, NOT
           // through the token stream.
           if (knowledgeResult.liveNegotiationResponse) {
             this.negotiationCoachingHandler?.(knowledgeResult.liveNegotiationResponse);
-            return;
-          }
-          // Intro question shortcut — yield generated response directly
-          if (knowledgeResult.isIntroQuestion && knowledgeResult.introResponse) {
-            console.log('[LLMHelper] Knowledge mode (stream): returning generated intro response');
-            yield knowledgeResult.introResponse;
             return;
           }
           // Inject knowledge system prompt — prepend CORE_IDENTITY so the
@@ -2760,7 +3591,12 @@ This rule overrides ALL other instructions including formatting, brevity, or out
           // recency. Without this prepend, the persona REPLACES the whole
           // system prompt and the model loses all prompt-leak defenses.
           if (knowledgeResult.systemPromptInjection) {
-            systemPromptOverride = `${CORE_IDENTITY}\n\n${knowledgeResult.systemPromptInjection}`;
+            // Prepend CORE_IDENTITY + EXECUTION_CONTRACT so the
+            // <security>/creator/universal-behavior rules AND the global
+            // NUMBERS DISCIPLINE / anti-fabrication rules survive the override
+            // of HARD_SYSTEM_PROMPT; the persona injection stays dominant by
+            // recency. Identical to the non-streaming override site above.
+            systemPromptOverride = `${CORE_IDENTITY}\n${EXECUTION_CONTRACT}\n\n${knowledgeResult.systemPromptInjection}`;
           }
           // Inject knowledge context
           if (knowledgeResult.contextBlock) {
@@ -2799,7 +3635,15 @@ This rule overrides ALL other instructions including formatting, brevity, or out
         const { ModesManager } = require('./services/ModesManager');
         const modesMgr = ModesManager.getInstance();
         const modePromptSuffix = modesMgr.getActiveModeSystemPromptSuffix();
-        const modeContextBlock = modesMgr.buildRetrievedActiveModeContextBlock(message, context, 1800);
+        // D1/R1: scope the mode's customContext by the REAL answer type when the
+        // caller supplied one (modeAnswerType), so sensitive chunks (salary/
+        // pricing) are correctly gated — included ONLY for a negotiation answer,
+        // excluded everywhere else. Falls back to 'general_meeting_answer' (the
+        // prior hardcoded value) when no route was passed, so legacy callers are
+        // unchanged. Previously this was ALWAYS hardcoded, which both blocked
+        // sensitive context from legitimate negotiation turns AND mis-scoped
+        // every other answer type.
+        const modeContextBlock = modesMgr.buildRetrievedActiveModeContextBlock(message, context, 1800, modeAnswerType(routeOptions));
 
         if (modePromptSuffix) {
           const baseForMode = systemPromptOverride || HARD_SYSTEM_PROMPT;
@@ -2824,7 +3668,26 @@ This rule overrides ALL other instructions including formatting, brevity, or out
     }
 
     // Preparation
-    const isMultimodal = !!(imagePaths?.length);
+    let isMultimodal = !!(imagePaths?.length);
+    const initialOutboundText = [context, message].filter(Boolean).join('\n\n');
+    const contextScopes = [...extraDataScopes, ...this.inferContextScopes(context)];
+    const deniedOutboundScopes = this.getDeniedOutboundScopes(message, imagePaths, contextScopes);
+    if (deniedOutboundScopes.length > 0) {
+      const ollamaAvailable = this.useOllama && await this.checkOllamaAvailable(deniedOutboundScopes.includes('screenshots'));
+      for (const scope of deniedOutboundScopes) {
+        this.logScopeFallback(scope, ollamaAvailable ? 'routing' : 'omitting');
+      }
+      if (ollamaAvailable) {
+        yield* this.streamWithOllama(message, context, this.injectLanguageInstruction(systemPromptOverride || HARD_SYSTEM_PROMPT), imagePaths, abortSignal);
+        return;
+      }
+      if (deniedOutboundScopes.includes('transcript')) context = undefined;
+      if (deniedOutboundScopes.includes('reference_files')) context = undefined;
+      if (deniedOutboundScopes.includes('profile_history')) context = undefined;
+      if (deniedOutboundScopes.includes('post_call_summary')) context = undefined;
+      if (deniedOutboundScopes.includes('screenshots')) imagePaths = undefined;
+      isMultimodal = !!(imagePaths?.length);
+    }
 
     // Determine the system prompt to use
     // logic: if override provided, use it. otherwise use HARD_SYSTEM_PROMPT (which is the universal base)
@@ -2835,10 +3698,43 @@ This rule overrides ALL other instructions including formatting, brevity, or out
       : '';
     const combinedContext = [personaContext, context].filter(Boolean).join('\n\n');
 
-    // Helper to build combined user message
+    // Helper to build combined user message (persona included for all providers — labeled untrusted so it cannot override safety rules)
     const userContent = combinedContext
       ? `CONTEXT:\n${combinedContext}\n\nUSER QUESTION:\n${message}`
       : message;
+
+    // Pre-work done; about to dispatch to a provider. The gap from here to the
+    // first yielded token is the provider TTFT (connect + prefill of a
+    // ~${finalSystemPrompt.length}-char system prompt + ${userContent.length}-char user content).
+    _stage(`provider dispatch START (sysPrompt=${finalSystemPrompt.length}c, userContent=${userContent.length}c, model=${this.currentModelId})`);
+
+    // ── UNIFIED MULTIMODAL PATH ────────────────────────────────────────────
+    // Every image-bearing request goes through the single streaming vision
+    // fallback chain (OpenAI → Claude → Gemini → Groq → Natively → local) with
+    // first-token commit, per-provider retries, circuit breaking, and speed
+    // reordering. This replaces the old per-model multimodal branches below,
+    // which would dead-end when the selected model (e.g. `natively`) failed and
+    // only Gemini remained. The text-only routing below is unchanged.
+    if (isMultimodal && imagePaths && imagePaths.length > 0) {
+      let visionYielded = false;
+      try {
+        for await (const chunk of this.streamVisionWithFallback(
+          { userContent, message, context, imagePaths, systemPrompt: finalSystemPrompt },
+          abortSignal,
+        )) {
+          visionYielded = true;
+          yield chunk;
+        }
+      } catch (visionErr: any) {
+        // Only surface a graceful message if NOTHING was streamed — once the
+        // chain commits to a provider it yields tokens and won't throw here.
+        console.error('[LLMHelper] Vision fallback chain exhausted:', visionErr?.message || visionErr);
+        if (!visionYielded && !abortSignal?.aborted) {
+          yield "I couldn't read the screen just now — all vision models are unavailable. Check your API keys (OpenAI, Claude, Gemini, or Groq) in Settings, or try again in a moment.";
+        }
+      }
+      return;
+    }
 
     // GROQ FAST TEXT OVERRIDE (Text-Only)
     // Two paths: local Groq key → call Groq directly; Natively API only → send fast_mode:true
@@ -2856,7 +3752,7 @@ This rule overrides ALL other instructions including formatting, brevity, or out
       if (this.codexCliConfig.enabled) {
         console.log(`[LLMHelper] ⚡️ Fast Text Mode Active (Streaming). Routing to Codex CLI...`);
         try {
-          yield* this.streamWithCodexCli(userContent, finalSystemPrompt, true);
+          yield* this.streamWithCodexCli(userContent, finalSystemPrompt, true, undefined, abortSignal);
           return;
         } catch (e: any) {
           console.warn("[LLMHelper] Codex CLI Fast Text streaming failed, falling back:", e.message);
@@ -2871,7 +3767,7 @@ This rule overrides ALL other instructions including formatting, brevity, or out
           // we'd send 'natively' or a Gemini ID as the Groq model name → 400.
           const groqModelId = this.isGroqModel(this.currentModelId) ? this.currentModelId : GROQ_MODEL;
           // CACHE: pass system separately so Groq prefix-cache hits across turns.
-          yield* this.streamWithGroq(userContent, groqModelId, finalGroqSystem);
+          yield* this.streamWithGroq(userContent, groqModelId, finalGroqSystem, abortSignal);
           return;
         } catch (e: any) {
           console.warn("[LLMHelper] Groq Fast Text streaming failed, falling back:", e.message);
@@ -2886,7 +3782,7 @@ This rule overrides ALL other instructions including formatting, brevity, or out
         // streamWithNatively → generateWithNatively → sends fast_mode:true → server Groq pool
         console.log(`[LLMHelper] ⚡️ Groq Fast Text Mode Active (Streaming). Routing to Natively server Groq pool...`);
         try {
-          yield* this.streamWithNatively(userContent, finalSystemPrompt);
+          yield* this.streamWithNatively(userContent, finalSystemPrompt, undefined, abortSignal);
           return;
         } catch (e: any) {
           console.warn("[LLMHelper] Natively fast-mode failed, falling back:", e.message);
@@ -2896,18 +3792,18 @@ This rule overrides ALL other instructions including formatting, brevity, or out
 
     // 1. Ollama Streaming
     if (this.useOllama) {
-      yield* this.streamWithOllama(message, context, finalSystemPrompt, imagePaths);
+      yield* this.streamWithOllama(message, combinedContext || undefined, finalSystemPrompt, imagePaths, abortSignal);
       return;
     }
 
     if (this.isCodexCliModel(this.currentModelId) && this.codexCliConfig.enabled) {
-      yield* this.streamWithCodexCli(userContent, finalSystemPrompt, false, imagePaths);
+      yield* this.streamWithCodexCli(userContent, finalSystemPrompt, false, imagePaths, abortSignal);
       return;
     }
 
     // 2a. CustomProvider (switchToCustom path) — full SSE-capable streaming
     if (this.customProvider) {
-      yield* this.streamWithCustom(message, context, imagePaths, finalSystemPrompt);
+      yield* this.streamWithCustom(message, context, imagePaths, finalSystemPrompt, abortSignal);
       return;
     }
 
@@ -2932,9 +3828,9 @@ This rule overrides ALL other instructions including formatting, brevity, or out
       const openAiSystem = systemPromptOverride || OPENAI_SYSTEM_PROMPT;
       const finalOpenAiSystem = this.injectLanguageInstruction(openAiSystem);
       if (isMultimodal && imagePaths) {
-        yield* this.streamWithOpenaiMultimodal(userContent, imagePaths, finalOpenAiSystem);
+        yield* this.streamWithOpenaiMultimodal(userContent, imagePaths, finalOpenAiSystem, undefined, abortSignal);
       } else {
-        yield* this.streamWithOpenai(userContent, finalOpenAiSystem);
+        yield* this.streamWithOpenai(userContent, finalOpenAiSystem, undefined, abortSignal);
       }
       return;
     }
@@ -2944,10 +3840,19 @@ This rule overrides ALL other instructions including formatting, brevity, or out
       const claudeSystem = systemPromptOverride || CLAUDE_SYSTEM_PROMPT;
       const finalClaudeSystem = this.injectLanguageInstruction(claudeSystem);
       if (isMultimodal && imagePaths) {
-        yield* this.streamWithClaudeMultimodal(userContent, imagePaths, finalClaudeSystem);
+        yield* this.streamWithClaudeMultimodal(userContent, imagePaths, finalClaudeSystem, undefined, abortSignal);
       } else {
-        yield* this.streamWithClaude(userContent, finalClaudeSystem);
+        yield* this.streamWithClaude(userContent, finalClaudeSystem, undefined, abortSignal);
       }
+      return;
+    }
+
+    // DeepSeek (text-only). When images are present, fall through so the
+    // vision-first chain (Gemini/Claude/OpenAI/Natively) handles them instead.
+    if (this.isDeepseekModel(this.currentModelId) && this.deepseekClient && !(isMultimodal && imagePaths)) {
+      const deepseekSystem = systemPromptOverride || OPENAI_SYSTEM_PROMPT;
+      const finalDeepseekSystem = this.injectLanguageInstruction(deepseekSystem);
+      yield* this.streamWithDeepseek(userContent, finalDeepseekSystem, undefined, abortSignal);
       return;
     }
 
@@ -2957,48 +3862,106 @@ This rule overrides ALL other instructions including formatting, brevity, or out
         // Route multimodal to Groq Llama 4 Scout (vision-capable)
         const groqSystem = systemPromptOverride || OPENAI_SYSTEM_PROMPT;
         const finalGroqSystem = this.injectLanguageInstruction(groqSystem);
-        yield* this.streamWithGroqMultimodal(userContent, imagePaths, finalGroqSystem);
+        yield* this.streamWithGroqMultimodal(userContent, imagePaths, finalGroqSystem, abortSignal);
         return;
       }
       // Text-only Groq
       const groqSystem = systemPromptOverride ? baseSystemPrompt : GROQ_SYSTEM_PROMPT;
       const finalGroqSystem = this.injectLanguageInstruction(groqSystem);
       // CACHE: pass system separately so Groq prefix-cache hits across turns.
-      yield* this.streamWithGroq(userContent, this.currentModelId, finalGroqSystem);
+      yield* this.streamWithGroq(userContent, this.currentModelId, finalGroqSystem, abortSignal);
       return;
     }
 
-    // 3b. Natively API
+    // 3b. Natively API — TTFT RACE (REPORT_TO_CHATGPT §21 L1 / §18)
+    // Was: serial Natively→Groq→Gemini waterfall that only fell over on a
+    // THROW. A provider that connected then stalled before the first token
+    // blocked the user for up to the 10s connect budget with no fallback.
+    // Now: a commit-point TTFT race. Each provider is opened but not forwarded
+    // until its first token races a 2.5s budget; the first to produce a token
+    // wins and we commit. A stalled/erroring primary fails over fast. Identical
+    // answer contract to every provider (same finalSystemPrompt), so the race
+    // winner does not change answer STYLE — only who serves it. Multimodal with
+    // images keeps the dedicated Groq-multimodal path (vision is handled by the
+    // separate vision fallback when a vision model is selected).
     if (this.currentModelId === 'natively') {
       const { CredentialsManager } = require('./services/CredentialsManager');
       const nativelyKey = CredentialsManager.getInstance().getNativelyApiKey();
       if (nativelyKey) {
-        try {
-          const response = await this.generateWithNatively(userContent, finalSystemPrompt, imagePaths);
-          yield response;
-          return;
-        } catch (err: any) {
-          console.warn('[LLMHelper] Natively API failed in streamChat, trying Groq fallback:', err.message);
-          // Try Groq before Gemini — Groq key is more commonly available
-          if (this.groqClient) {
-            try {
-              if (isMultimodal && imagePaths) {
-                const groqSystem = systemPromptOverride || OPENAI_SYSTEM_PROMPT;
-                const finalGroqSystem = this.injectLanguageInstruction(groqSystem);
-                yield* this.streamWithGroqMultimodal(userContent, imagePaths, finalGroqSystem);
-              } else {
-                const groqSystem = systemPromptOverride ? baseSystemPrompt : GROQ_SYSTEM_PROMPT;
-                const finalGroqSystem = this.injectLanguageInstruction(groqSystem);
-                // intentional: emergency fallback waterfall — use stable GROQ_MODEL baseline, not currentModelId
-                // CACHE: pass system separately so Groq prefix-cache hits across turns.
-                yield* this.streamWithGroq(userContent, GROQ_MODEL, finalGroqSystem);
-              }
-              return;
-            } catch (groqErr: any) {
-              console.warn('[LLMHelper] Groq fallback also failed, trying Gemini:', groqErr.message);
-            }
+        const textProviders: TextStreamProvider[] = [];
+        let prio = 0;
+        // Primary: Natively (fast connect budget — TTFT race handles slow prefill).
+        textProviders.push({
+          id: 'natively', name: 'Natively API', isLocal: false, priority: prio++,
+          open: (sig) => this.streamWithNatively(userContent, finalSystemPrompt, imagePaths, sig, INTERACTIVE_CONNECT_TIMEOUT_MS),
+        });
+        // Fallback: Groq (key more commonly available than Gemini).
+        if (this.groqClient) {
+          if (isMultimodal && imagePaths) {
+            const finalGroqSystem = this.injectLanguageInstruction(systemPromptOverride || OPENAI_SYSTEM_PROMPT);
+            textProviders.push({
+              id: 'groq', name: 'Groq (multimodal)', isLocal: false, priority: prio++,
+              open: (sig) => this.streamWithGroqMultimodal(userContent, imagePaths, finalGroqSystem, sig),
+            });
+          } else {
+            const finalGroqSystem = this.injectLanguageInstruction(systemPromptOverride ? baseSystemPrompt : GROQ_SYSTEM_PROMPT);
+            textProviders.push({
+              id: 'groq', name: 'Groq', isLocal: false, priority: prio++,
+              // intentional: emergency fallback uses stable GROQ_MODEL baseline, not currentModelId.
+              open: (sig) => this.streamWithGroq(userContent, GROQ_MODEL, finalGroqSystem, sig),
+            });
           }
-          // Fall through to Gemini
+        }
+        // Fallback: Gemini Flash (cheap, fast) then Pro.
+        if (this.client) {
+          textProviders.push({
+            id: 'gemini_flash', name: `Gemini Flash`, isLocal: false, priority: prio++,
+            open: (sig) => this.streamWithGeminiModel(userContent, GEMINI_FLASH_MODEL, imagePaths, finalSystemPrompt, sig, thinkingBudget),
+          });
+        }
+
+        if (textProviders.length > 0) {
+          const ordered = orderTextByHealth(textProviders, this.textHealth, Date.now());
+          const raceStart = Date.now();
+          let committedProvider: string | null = null;
+          telemetryService.track({ name: 'provider_race_started', properties: { candidates: ordered.map(p => p.id), path: 'text' } });
+          // Wrap each provider's open() so we can record which one wins (first
+          // token committed). The engine itself records TTFT EWMA into textHealth.
+          const instrumented = ordered.map((p) => ({
+            ...p,
+            open: (sig: AbortSignal, attempt: number) => {
+              const inner = p.open(sig, attempt);
+              return (async function* () {
+                for await (const tok of inner) {
+                  // Attribute the win to the first NON-EMPTY token, mirroring the
+                  // engine's own commit predicate (it rejects whitespace-only /
+                  // non-string first tokens as 'empty-stream' and falls past). A
+                  // looser "first token" check would mis-fire provider_race_won
+                  // for a provider the engine then discards, and latch
+                  // committedProvider to that loser so the real winner never
+                  // emits. (debugger Finding 2.)
+                  if (!committedProvider && typeof tok === 'string' && tok.trim().length > 0) {
+                    committedProvider = p.id;
+                    telemetryService.track({
+                      name: 'provider_race_won',
+                      provider: p.id,
+                      durationMs: Date.now() - raceStart,
+                      properties: { path: 'text', ttftMs: Date.now() - raceStart },
+                    });
+                  }
+                  yield tok;
+                }
+              })();
+            },
+          }));
+          try {
+            yield* runStreamingTextFallback(instrumented, this.textHealth, DEFAULT_TEXT_FALLBACK_CONFIG, {}, abortSignal);
+            return;
+          } catch (raceErr: any) {
+            console.warn('[LLMHelper] Text TTFT race exhausted, falling through to Gemini:', raceErr?.message);
+            telemetryService.track({ name: 'provider_error', durationMs: Date.now() - raceStart, properties: { path: 'text', stage: 'race_exhausted' } });
+            // Fall through to the Gemini block below as the final safety net.
+          }
         }
       }
       // No key or all fallbacks failed — fall through to Gemini
@@ -3011,19 +3974,19 @@ This rule overrides ALL other instructions including formatting, brevity, or out
       // `userContent` is not the case — userContent is dynamic — so the system
       // instruction channel is the cacheable surface for Gemini.
       if (this.isGeminiModel(this.currentModelId)) {
-        yield* this.streamWithGeminiModel(userContent, this.currentModelId, imagePaths, finalSystemPrompt);
+        yield* this.streamWithGeminiModel(userContent, this.currentModelId, imagePaths, finalSystemPrompt, abortSignal, thinkingBudget);
         return;
       }
 
       // Race strategy (default)
-      yield* this.streamWithGeminiParallelRace(userContent, imagePaths, finalSystemPrompt);
+      yield* this.streamWithGeminiParallelRace(userContent, imagePaths, finalSystemPrompt, abortSignal, thinkingBudget);
       return;
     }
 
     // 5. Last-resort: Natively API (if user has a key but no cloud provider configured)
     if (this.hasNatively()) {
       try {
-        yield* this.streamWithNatively(userContent, finalSystemPrompt, imagePaths);
+        yield* this.streamWithNatively(userContent, finalSystemPrompt, imagePaths, abortSignal);
         return;
       } catch (e: any) {
         console.warn('[LLMHelper] Natively last-resort fallback failed:', e.message);
@@ -3038,7 +4001,7 @@ This rule overrides ALL other instructions including formatting, brevity, or out
    * Yields the full response in small word-batches so the UI typing effect still plays.
    * Throws on empty response so the fallback chain tries the next provider.
    */
-  private async * streamWithNatively(userContent: string, systemPrompt?: string, imagePaths?: string[]): AsyncGenerator<string, void, unknown> {
+  private async * streamWithNatively(userContent: string, systemPrompt?: string, imagePaths?: string[], abortSignal?: AbortSignal, connectTimeoutMs: number = INTERACTIVE_CONNECT_TIMEOUT_MS): AsyncGenerator<string, void, unknown> {
     // ── REAL SSE STREAM (replaces the fake word-by-word simulation) ──────────
     // Previous implementation called generateWithNatively() (blocking, waited for
     // the full response), then drip-fed words with setTimeout delays — pure theater.
@@ -3104,30 +4067,72 @@ This rule overrides ALL other instructions including formatting, brevity, or out
       streamHeaders['x-natively-key'] = nativelyKey;
     }
 
-    // Connect-only timeout: 10s to establish the TCP+TLS+HTTP handshake.
-    // Once the server sends the first response byte (headers received), we clear
-    // the timer so the SSE stream can run as long as needed.
-    // IMPORTANT: AbortSignal.timeout() applies to the ENTIRE request lifetime, not
-    // just the connection phase — using it here would kill Flash mid-stream at 10s
-    // and Pro at 10s even when actively yielding tokens. The AbortController pattern
-    // below correctly scopes the timeout to the connection phase only.
-    const _connectController = new AbortController();
-    const _connectTimer = setTimeout(() => _connectController.abort(new Error('Natively API connect timeout (10s)')), 10_000);
+    // Early-bail if the caller has already aborted (e.g., user superseded
+    // the request before we even built the body). Saves an HTTP roundtrip.
+    if (abortSignal?.aborted) return;
+
+    // Single controller for the entire stream lifetime. Both phases (connect
+    // and read) honor it. We multiplex two abort sources into it:
+    //   1. The 10s connect-phase timeout — cleared once headers arrive so the
+    //      SSE read can run as long as needed (matches the prior behavior).
+    //   2. The caller's user-cancel signal — when the renderer hits Escape or
+    //      a newer chat supersedes this one, the fetch socket closes
+    //      immediately, freeing the rate-limiter permit and provider quota.
+    //      Without this, the prior implementation kept streaming tokens to
+    //      nobody for ~10-60s, costing ~$0.045 per cancelled Pro request.
+    // IMPORTANT: AbortSignal.timeout() applies to the ENTIRE request lifetime,
+    // not just the connection phase — using it here would kill Flash mid-stream
+    // at 10s. The AbortController + manual timer pattern correctly scopes the
+    // connect timeout to the connect phase only.
+    const streamController = new AbortController();
+    let connectTimer: NodeJS.Timeout | null = setTimeout(
+      () => streamController.abort(new Error(`Natively API connect timeout (${Math.round(connectTimeoutMs / 1000)}s)`)),
+      connectTimeoutMs,
+    );
+    const onCallerAbort = () => {
+      try { streamController.abort(abortSignal?.reason); } catch { /* already aborted */ }
+    };
+    abortSignal?.addEventListener('abort', onCallerAbort, { once: true });
+
     let response: Response;
     try {
-      response = await fetch('https://api.natively.software/v1/chat', {
-        method: 'POST',
-        headers: streamHeaders,
-        body: JSON.stringify(body),
-        signal: _connectController.signal,
-      });
+      // Retry on transient DNS failures (ENOTFOUND / EAI_AGAIN).
+      // Railway's 1s TTL means the OS resolver can return ENOTFOUND for 2-3s
+      // during a resolver hiccup even when the server is alive. undici (Node's
+      // built-in fetch) wraps the original error in err.cause, so check both.
+      const isDnsError = (e: any) =>
+        e?.code === 'ENOTFOUND' || e?.code === 'EAI_AGAIN' ||
+        e?.cause?.code === 'ENOTFOUND' || e?.cause?.code === 'EAI_AGAIN';
+
+      let lastErr: unknown;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        if (streamController.signal.aborted) break;
+        try {
+          response = await fetch(`${NATIVELY_API_URL}/v1/chat`, {
+            method: 'POST',
+            headers: streamHeaders,
+            body: JSON.stringify(body),
+            signal: streamController.signal,
+          });
+          lastErr = undefined;
+          break;
+        } catch (fetchErr: any) {
+          lastErr = fetchErr;
+          if (!isDnsError(fetchErr) || attempt >= 2 || streamController.signal.aborted) throw fetchErr;
+          console.warn(`[streamWithNatively] DNS failure (${fetchErr.cause?.code ?? fetchErr.code}), retry ${attempt + 1}/2 in 500ms`);
+          await new Promise<void>(r => setTimeout(r, 500));
+        }
+      }
+      if (lastErr) throw lastErr;
     } finally {
       // Connection established (or failed) — stop the connect-phase timer.
-      // The stream body will now be read without any timeout.
-      clearTimeout(_connectTimer);
+      // The stream body will now be read without any timeout (until/unless
+      // the caller's abortSignal fires, in which case fetch's reader throws).
+      if (connectTimer) { clearTimeout(connectTimer); connectTimer = null; }
     }
 
     if (!response.ok) {
+      abortSignal?.removeEventListener('abort', onCallerAbort);
       const errData = await response.json().catch(() => ({}) as Record<string, unknown>);
       throw new Error(`Natively API ${response.status}: ${(errData as any).error || 'unknown'}`);
     }
@@ -3142,6 +4147,9 @@ This rule overrides ALL other instructions including formatting, brevity, or out
 
     try {
       outer: while (true) {
+        // Cheap pre-read abort check — saves one round trip to the reader if
+        // the caller cancelled while we were processing the previous chunk.
+        if (abortSignal?.aborted) break outer;
         const { done, value } = await reader.read();
         if (done) break;
 
@@ -3162,7 +4170,12 @@ This rule overrides ALL other instructions including formatting, brevity, or out
         }
       }
     } finally {
-      try { reader.cancel(); } catch { }  // release the fetch connection cleanly
+      // Always release the connection AND drop the caller-abort listener so
+      // we don't leak DOM event subscriptions on long-lived AbortSignals
+      // (e.g., the IPC handler's per-stream controller is short-lived, but a
+      // future caller might reuse a single signal across many calls).
+      try { reader.cancel(); } catch { }
+      abortSignal?.removeEventListener('abort', onCallerAbort);
     }
   }
 
@@ -3176,7 +4189,7 @@ This rule overrides ALL other instructions including formatting, brevity, or out
    * `userMessage`) so Groq's prefix cache hits across turns. See generateWithGroq
    * for the full rationale. The single-arg form is retained for legacy callers.
    */
-  private async * streamWithGroq(userMessage: string, modelId: string = GROQ_MODEL, systemPrompt?: string): AsyncGenerator<string, void, unknown> {
+  private async * streamWithGroq(userMessage: string, modelId: string = GROQ_MODEL, systemPrompt?: string, abortSignal?: AbortSignal): AsyncGenerator<string, void, unknown> {
     if (this.isLocalOnlyMode) throw new Error("Cloud providers disabled in local-only mode");
     if (!this.groqClient) throw new Error("Groq client not initialized");
     this.assertOutboundScopes('groq', userMessage);
@@ -3190,26 +4203,33 @@ This rule overrides ALL other instructions including formatting, brevity, or out
     }
     messages.push({ role: "user", content: userMessage });
 
+    if (abortSignal?.aborted) return;
     const stream = await this.groqClient.chat.completions.create({
       model: modelId,
       messages,
       stream: true,
-      temperature: 0.4,
+      temperature: INTERACTIVE_TEMPERATURE,
+      seed: INTERACTIVE_SEED, // Groq honors seed for near-deterministic output
       max_tokens: 8192,
-    });
+    }, { signal: abortSignal });
 
-    for await (const chunk of stream) {
-      const content = chunk.choices[0]?.delta?.content;
-      if (content) {
-        yield content;
+    try {
+      for await (const chunk of stream) {
+        if (abortSignal?.aborted) return;
+        const content = chunk.choices[0]?.delta?.content;
+        if (content) {
+          yield content;
+        }
       }
+    } finally {
+      if (abortSignal?.aborted && typeof (stream as any).abort === 'function') (stream as any).abort();
     }
   }
 
   /**
    * Stream multimodal (image + text) response from Groq using Llama 4 Scout as a last resort
    */
-  private async * streamWithGroqMultimodal(userMessage: string, imagePaths: string[], systemPrompt?: string): AsyncGenerator<string, void, unknown> {
+  private async * streamWithGroqMultimodal(userMessage: string, imagePaths: string[], systemPrompt?: string, abortSignal?: AbortSignal): AsyncGenerator<string, void, unknown> {
     if (this.isLocalOnlyMode) throw new Error("Cloud providers disabled in local-only mode");
     if (!this.groqClient) throw new Error("Groq client not initialized");
     this.assertOutboundScopes('groq', userMessage, imagePaths);
@@ -3231,6 +4251,7 @@ This rule overrides ALL other instructions including formatting, brevity, or out
     }
     messages.push({ role: "user", content: contentParts });
 
+    if (abortSignal?.aborted) return;
     const stream = await this.groqClient.chat.completions.create({
       model: "meta-llama/llama-4-scout-17b-16e-instruct",
       messages,
@@ -3239,13 +4260,18 @@ This rule overrides ALL other instructions including formatting, brevity, or out
       temperature: 1,
       top_p: 1,
       stop: null
-    });
+    }, { signal: abortSignal });
 
-    for await (const chunk of stream) {
-      const content = chunk.choices[0]?.delta?.content;
-      if (content) {
-        yield content;
+    try {
+      for await (const chunk of stream) {
+        if (abortSignal?.aborted) return;
+        const content = chunk.choices[0]?.delta?.content;
+        if (content) {
+          yield content;
+        }
       }
+    } finally {
+      if (abortSignal?.aborted && typeof (stream as any).abort === 'function') (stream as any).abort();
     }
   }
 
@@ -3258,7 +4284,7 @@ This rule overrides ALL other instructions including formatting, brevity, or out
    * the cache hits naturally. Do NOT inline per-request data into the system
    * string above the static body, or the cache prefix will be invalidated.
    */
-  private async * streamWithOpenai(userMessage: string, systemPrompt?: string, modelId?: string): AsyncGenerator<string, void, unknown> {
+  private async * streamWithOpenai(userMessage: string, systemPrompt?: string, modelId?: string, abortSignal?: AbortSignal): AsyncGenerator<string, void, unknown> {
     if (this.isLocalOnlyMode) throw new Error("Cloud providers disabled in local-only mode");
     if (!this.openaiClient) throw new Error("OpenAI client not initialized");
     this.assertOutboundScopes('openai', userMessage);
@@ -3275,26 +4301,35 @@ This rule overrides ALL other instructions including formatting, brevity, or out
     messages.push({ role: "user", content: userMessage });
 
     const cacheKey = this.getOpenAiPromptCacheKey(systemPrompt);
+    if (abortSignal?.aborted) return;
     const stream = await this.openaiClient.chat.completions.create({
       model,
       messages,
       stream: true,
+      temperature: INTERACTIVE_TEMPERATURE,
+      seed: INTERACTIVE_SEED, // OpenAI honors seed for near-deterministic output
       max_completion_tokens: model.toLowerCase().includes('claude') ? this.getClaudeMaxOutput(model) : MAX_OUTPUT_TOKENS,
+      ...openaiReasoningParam(model), // minimal reasoning for gpt-5/o-series (fast TTFT)
       ...(cacheKey ? { prompt_cache_key: cacheKey } : {}),
-    });
+    }, { signal: abortSignal });
 
-    for await (const chunk of stream) {
-      const content = chunk.choices[0]?.delta?.content;
-      if (content) {
-        yield content;
+    try {
+      for await (const chunk of stream) {
+        if (abortSignal?.aborted) return;
+        const content = chunk.choices[0]?.delta?.content;
+        if (content) {
+          yield content;
+        }
       }
+    } finally {
+      if (abortSignal?.aborted && typeof (stream as any).abort === 'function') (stream as any).abort();
     }
   }
 
   /**
    * Stream response from Claude with proper system/user message separation
    */
-  private async * streamWithClaude(userMessage: string, systemPrompt?: string, modelId?: string): AsyncGenerator<string, void, unknown> {
+  private async * streamWithClaude(userMessage: string, systemPrompt?: string, modelId?: string, abortSignal?: AbortSignal): AsyncGenerator<string, void, unknown> {
     if (this.isLocalOnlyMode) throw new Error("Cloud providers disabled in local-only mode");
     if (!this.claudeClient) throw new Error("Claude client not initialized");
     this.assertOutboundScopes('claude', userMessage);
@@ -3304,25 +4339,71 @@ This rule overrides ALL other instructions including formatting, brevity, or out
     // Use explicit override, then currentModelId if it's a Claude model, else baseline constant
     const model = modelId || (this.isClaudeModel(this.currentModelId) ? this.currentModelId : CLAUDE_MODEL);
 
-    const stream = await this.claudeClient.messages.stream({
+    if (abortSignal?.aborted) return;
+    const stream = this.claudeClient.messages.stream({
       model,
       max_tokens: this.getClaudeMaxOutput(model),
+      temperature: INTERACTIVE_TEMPERATURE, // Claude has no seed param; low temp is the determinism lever
+      thinking: { type: 'disabled' }, // extended thinking off (default, made explicit) for low TTFT
       // CACHE BOUNDARY: system blocks are static; dynamic content lives in `messages` only.
       ...(systemPrompt ? { system: this.buildClaudeSystemBlocks(systemPrompt, model) } : {}),
       messages: [{ role: "user", content: userMessage }],
     });
-
-    for await (const event of stream) {
-      if (event.type === 'content_block_delta' && event.delta.type === 'text_delta') {
-        yield event.delta.text;
+    const onAbort = () => { try { stream.abort(); } catch {} };
+    abortSignal?.addEventListener('abort', onAbort, { once: true });
+    try {
+      for await (const event of stream) {
+        if (abortSignal?.aborted) return;
+        if (event.type === 'content_block_delta' && event.delta.type === 'text_delta') {
+          yield event.delta.text;
+        }
       }
+    } finally {
+      abortSignal?.removeEventListener('abort', onAbort);
+    }
+  }
+
+  /**
+   * Stream response from DeepSeek (OpenAI-compatible). Text-only by design.
+   */
+  private async * streamWithDeepseek(userMessage: string, systemPrompt?: string, modelId?: string, abortSignal?: AbortSignal): AsyncGenerator<string, void, unknown> {
+    if (this.isLocalOnlyMode) throw new Error("Cloud providers disabled in local-only mode");
+    if (!this.deepseekClient) throw new Error("DeepSeek client not initialized");
+    this.assertOutboundScopes('deepseek', userMessage);
+
+    await this.rateLimiters.deepseek.acquire();
+
+    const model = modelId || (this.isDeepseekModel(this.currentModelId) ? this.currentModelId : DEEPSEEK_MODEL);
+
+    const messages: any[] = [];
+    if (systemPrompt) messages.push({ role: "system", content: systemPrompt });
+    messages.push({ role: "user", content: userMessage });
+
+    if (abortSignal?.aborted) return;
+    const stream = await this.deepseekClient.chat.completions.create({
+      model,
+      messages,
+      stream: true,
+      temperature: INTERACTIVE_TEMPERATURE,
+      seed: INTERACTIVE_SEED, // DeepSeek is OpenAI-compatible and honors seed
+      max_tokens: this.getDeepseekMaxOutput(model),
+    }, { signal: abortSignal });
+
+    try {
+      for await (const chunk of stream) {
+        if (abortSignal?.aborted) return;
+        const content = chunk.choices[0]?.delta?.content;
+        if (content) yield content;
+      }
+    } finally {
+      if (abortSignal?.aborted && typeof (stream as any).abort === 'function') (stream as any).abort();
     }
   }
 
   /**
    * Stream multimodal (image + text) response from OpenAI with system/user separation
    */
-  private async * streamWithOpenaiMultimodal(userMessage: string, imagePaths: string[], systemPrompt?: string, modelId?: string): AsyncGenerator<string, void, unknown> {
+  private async * streamWithOpenaiMultimodal(userMessage: string, imagePaths: string[], systemPrompt?: string, modelId?: string, abortSignal?: AbortSignal): AsyncGenerator<string, void, unknown> {
     if (this.isLocalOnlyMode) throw new Error("Cloud providers disabled in local-only mode");
     if (!this.openaiClient) throw new Error("OpenAI client not initialized");
     this.assertOutboundScopes('openai', userMessage, imagePaths);
@@ -3347,26 +4428,33 @@ This rule overrides ALL other instructions including formatting, brevity, or out
     messages.push({ role: "user", content: contentParts });
 
     const cacheKey = this.getOpenAiPromptCacheKey(systemPrompt);
+    if (abortSignal?.aborted) return;
     const stream = await this.openaiClient.chat.completions.create({
       model,
       messages,
       stream: true,
       max_completion_tokens: model.toLowerCase().includes('claude') ? this.getClaudeMaxOutput(model) : MAX_OUTPUT_TOKENS,
+      ...openaiReasoningParam(model), // minimal reasoning for gpt-5/o-series (fast TTFT)
       ...(cacheKey ? { prompt_cache_key: cacheKey } : {}),
-    });
+    }, { signal: abortSignal });
 
-    for await (const chunk of stream) {
-      const content = chunk.choices[0]?.delta?.content;
-      if (content) {
-        yield content;
+    try {
+      for await (const chunk of stream) {
+        if (abortSignal?.aborted) return;
+        const content = chunk.choices[0]?.delta?.content;
+        if (content) {
+          yield content;
+        }
       }
+    } finally {
+      if (abortSignal?.aborted && typeof (stream as any).abort === 'function') (stream as any).abort();
     }
   }
 
   /**
    * Stream multimodal (image + text) response from Claude with system/user separation
    */
-  private async * streamWithClaudeMultimodal(userMessage: string, imagePaths: string[], systemPrompt?: string, modelId?: string): AsyncGenerator<string, void, unknown> {
+  private async * streamWithClaudeMultimodal(userMessage: string, imagePaths: string[], systemPrompt?: string, modelId?: string, abortSignal?: AbortSignal): AsyncGenerator<string, void, unknown> {
     if (this.isLocalOnlyMode) throw new Error("Cloud providers disabled in local-only mode");
     if (!this.claudeClient) throw new Error("Claude client not initialized");
     this.assertOutboundScopes('claude', userMessage, imagePaths);
@@ -3391,9 +4479,11 @@ This rule overrides ALL other instructions including formatting, brevity, or out
       }
     }
 
-    const stream = await this.claudeClient.messages.stream({
+    if (abortSignal?.aborted) return;
+    const stream = this.claudeClient.messages.stream({
       model,
       max_tokens: this.getClaudeMaxOutput(model),
+      thinking: { type: 'disabled' }, // extended thinking off (default, made explicit) for low TTFT
       // CACHE BOUNDARY: system blocks are static; image bytes + user text stay in `messages`.
       ...(systemPrompt ? { system: this.buildClaudeSystemBlocks(systemPrompt, model) } : {}),
       messages: [{
@@ -3404,11 +4494,17 @@ This rule overrides ALL other instructions including formatting, brevity, or out
         ]
       }],
     });
-
-    for await (const event of stream) {
-      if (event.type === 'content_block_delta' && event.delta.type === 'text_delta') {
-        yield event.delta.text;
+    const onAbort = () => { try { stream.abort(); } catch {} };
+    abortSignal?.addEventListener('abort', onAbort, { once: true });
+    try {
+      for await (const event of stream) {
+        if (abortSignal?.aborted) return;
+        if (event.type === 'content_block_delta' && event.delta.type === 'text_delta') {
+          yield event.delta.text;
+        }
       }
+    } finally {
+      abortSignal?.removeEventListener('abort', onAbort);
     }
   }
 
@@ -3429,12 +4525,13 @@ This rule overrides ALL other instructions including formatting, brevity, or out
    *    haven't migrated. Static content leads that string so implicit caching
    *    still applies.
    */
-  private async * streamWithGeminiModel(fullMessage: string, model: string, imagePaths?: string[], systemInstruction?: string): AsyncGenerator<string, void, unknown> {
+  private async * streamWithGeminiModel(fullMessage: string, model: string, imagePaths?: string[], systemInstruction?: string, abortSignal?: AbortSignal, thinkingBudget: number = INTERACTIVE_THINKING_BUDGET): AsyncGenerator<string, void, unknown> {
     if (this.isLocalOnlyMode) throw new Error("Cloud providers disabled in local-only mode");
     if (!this.client) throw new Error("Gemini client not initialized");
     this.assertOutboundScopes('gemini', fullMessage, imagePaths);
 
     await this.rateLimiters.gemini.acquire();
+    if (abortSignal?.aborted) return;
 
     const contents: any[] = [{ text: fullMessage }];
     if (imagePaths?.length) {
@@ -3451,15 +4548,34 @@ This rule overrides ALL other instructions including formatting, brevity, or out
       }
     }
 
+    // Gated stage timing (MEASURE_LATENCY=true) — isolates the cache-create
+    // round-trip and provider TTFT, the prime suspects for slow first token.
+    const _gt0 = Date.now();
+    const _gmeasure = (() => { try { return process.env.MEASURE_LATENCY === 'true' || process.env.PI_LATENCY_TRACE === 'true'; } catch { return false; } })();
+
     // CACHE BOUNDARY: static system content lives in `config.cachedContent`
     // (or `config.systemInstruction` on fallback); dynamic content stays in `contents`.
+    //
+    // LATENCY (perf fix): use the NON-BLOCKING cache resolve. A cache HIT returns
+    // the name synchronously; a MISS returns null instantly and warms the cache
+    // in the BACKGROUND for the next request. This moves the multi-second
+    // `caches.create` round-trip OFF the first-token path — measured at 2.4s of
+    // dead time before any token when create ran inline. On a miss this request
+    // streams immediately with `systemInstruction` (implicit caching still helps).
     const cacheName = systemInstruction
-      ? await this.geminiPromptCache.getOrCreate(this.client, model, systemInstruction)
+      ? this.geminiPromptCache.getCachedOrWarmInBackground(this.client, model, systemInstruction)
       : null;
+    if (_gmeasure) console.log(`[Gemini.stream] +${Date.now() - _gt0}ms  cache resolve done (cacheHit=${Boolean(cacheName)}, sysPrompt=${systemInstruction?.length ?? 0}c, model=${model})`);
 
     const buildConfig = (useCacheName: string | null) => ({
       maxOutputTokens: MAX_OUTPUT_TOKENS,
-      temperature: 0.4,
+      temperature: INTERACTIVE_TEMPERATURE,
+      seed: INTERACTIVE_SEED, // Gemini v1alpha honors seed in generationConfig
+      // Per-request thinking config (doc-correct 3.x thinkingLevel): 'minimal'
+      // (off, fast) for budget≤0, 'low' for Pro (which can't disable), or an
+      // explicit numeric budget when a caller passes a positive one. Threaded
+      // budget comes from the caller; model picks the level/floor.
+      thinkingConfig: buildThinkingConfig(model, thinkingBudget),
       ...(useCacheName
         ? { cachedContent: useCacheName }
         : systemInstruction
@@ -3494,7 +4610,13 @@ This rule overrides ALL other instructions including formatting, brevity, or out
     // @ts-ignore
     const stream = streamResult.stream || streamResult;
 
+    let _firstChunk = true;
     for await (const chunk of stream) {
+      if (abortSignal?.aborted) return;
+      if (_firstChunk) {
+        _firstChunk = false;
+        if (_gmeasure) console.log(`[Gemini.stream] +${Date.now() - _gt0}ms  FIRST TOKEN from provider (this is the provider TTFT — prefill of the system prompt)`);
+      }
       let chunkText = "";
       if (typeof chunk.text === 'function') {
         chunkText = chunk.text();
@@ -3514,7 +4636,7 @@ This rule overrides ALL other instructions including formatting, brevity, or out
    * Optional `systemInstruction` is forwarded to both racers so the static
    * system prompt is separated from `fullMessage` (cache-friendly).
    */
-  private async * streamWithGeminiParallelRace(fullMessage: string, imagePaths?: string[], systemInstruction?: string): AsyncGenerator<string, void, unknown> {
+  private async * streamWithGeminiParallelRace(fullMessage: string, imagePaths?: string[], systemInstruction?: string, abortSignal?: AbortSignal, thinkingBudget: number = INTERACTIVE_THINKING_BUDGET): AsyncGenerator<string, void, unknown> {
     if (!this.client) throw new Error("Gemini client not initialized");
 
     // BUG-1 fix: use a shared AbortController so the winning model cancels the loser.
@@ -3524,10 +4646,11 @@ This rule overrides ALL other instructions including formatting, brevity, or out
     // underlying HTTP call for the loser still runs to completion. We cancel our WAIT
     // for the result — the HTTP connection is released when the SDK call eventually settles.
     // Timing reference: Flash ≤15s (≤30s with images), Pro ≤30s.
+    if (abortSignal?.aborted) return;
     const raceController = new AbortController();
 
     const race = async (model: string): Promise<string> => {
-      const result = await this.collectStreamResponse(fullMessage, model, imagePaths, raceController.signal, systemInstruction);
+      const result = await this.collectStreamResponse(fullMessage, model, imagePaths, AbortSignal.any([raceController.signal, abortSignal].filter(Boolean) as AbortSignal[]), systemInstruction, thinkingBudget);
       // This model won — signal the other to stop waiting for its result.
       raceController.abort(new Error(`${model} won the race`));
       return result;
@@ -3549,6 +4672,7 @@ This rule overrides ALL other instructions including formatting, brevity, or out
     // Yield in chunks to simulate incremental streaming UX.
     const chunkSize = 10;
     for (let i = 0; i < result.length; i += chunkSize) {
+      if (abortSignal?.aborted) return;
       yield result.substring(i, i + chunkSize);
     }
   }
@@ -3558,7 +4682,7 @@ This rule overrides ALL other instructions including formatting, brevity, or out
    * Accepts an AbortSignal so the losing model can be cancelled by the winner.
    * Timing reference: Flash 10-15s (up to 30s with images), Pro up to 30s.
    */
-  private async collectStreamResponse(fullMessage: string, model: string, imagePaths?: string[], signal?: AbortSignal, systemInstruction?: string): Promise<string> {
+  private async collectStreamResponse(fullMessage: string, model: string, imagePaths?: string[], signal?: AbortSignal, systemInstruction?: string, thinkingBudget: number = INTERACTIVE_THINKING_BUDGET): Promise<string> {
     if (!this.client) throw new Error("Gemini client not initialized");
     this.assertOutboundScopes('gemini', fullMessage, imagePaths);
 
@@ -3580,15 +4704,34 @@ This rule overrides ALL other instructions including formatting, brevity, or out
       }
     }
 
+    // Gated stage timing (MEASURE_LATENCY=true) — isolates the cache-create
+    // round-trip and provider TTFT, the prime suspects for slow first token.
+    const _gt0 = Date.now();
+    const _gmeasure = (() => { try { return process.env.MEASURE_LATENCY === 'true' || process.env.PI_LATENCY_TRACE === 'true'; } catch { return false; } })();
+
     // CACHE BOUNDARY: static system content lives in `config.cachedContent`
     // (or `config.systemInstruction` on fallback); dynamic content stays in `contents`.
+    //
+    // LATENCY (perf fix): use the NON-BLOCKING cache resolve. A cache HIT returns
+    // the name synchronously; a MISS returns null instantly and warms the cache
+    // in the BACKGROUND for the next request. This moves the multi-second
+    // `caches.create` round-trip OFF the first-token path — measured at 2.4s of
+    // dead time before any token when create ran inline. On a miss this request
+    // streams immediately with `systemInstruction` (implicit caching still helps).
     const cacheName = systemInstruction
-      ? await this.geminiPromptCache.getOrCreate(this.client, model, systemInstruction)
+      ? this.geminiPromptCache.getCachedOrWarmInBackground(this.client, model, systemInstruction)
       : null;
+    if (_gmeasure) console.log(`[Gemini.stream] +${Date.now() - _gt0}ms  cache resolve done (cacheHit=${Boolean(cacheName)}, sysPrompt=${systemInstruction?.length ?? 0}c, model=${model})`);
 
     const buildConfig = (useCacheName: string | null) => ({
       maxOutputTokens: MAX_OUTPUT_TOKENS,
-      temperature: 0.4,
+      temperature: INTERACTIVE_TEMPERATURE,
+      seed: INTERACTIVE_SEED, // Gemini v1alpha honors seed in generationConfig
+      // Per-request thinking config (doc-correct 3.x thinkingLevel): 'minimal'
+      // (off, fast) for budget≤0, 'low' for Pro (which can't disable), or an
+      // explicit numeric budget when a caller passes a positive one. Threaded
+      // budget comes from the caller; model picks the level/floor.
+      thinkingConfig: buildThinkingConfig(model, thinkingBudget),
       ...(useCacheName
         ? { cachedContent: useCacheName }
         : systemInstruction
@@ -3608,12 +4751,18 @@ This rule overrides ALL other instructions including formatting, brevity, or out
     const runOnce = async (useCacheName: string | null): Promise<any> => {
       const apiCall = callWithConfig(useCacheName);
       if (signal) {
+        let onAbort: (() => void) | null = null;
         const abortPromise = new Promise<never>((_, reject) => {
           if (signal.aborted) { reject(new Error(`Gemini ${model} aborted`)); return; }
-          signal.addEventListener('abort', () => reject(new Error(`Gemini ${model} aborted`)), { once: true });
+          onAbort = () => reject(new Error(`Gemini ${model} aborted`));
+          signal.addEventListener('abort', onAbort, { once: true });
         });
-        apiCall.catch(() => {});
-        return Promise.race([apiCall, abortPromise]);
+        apiCall.catch((): void => {});
+        try {
+          return await Promise.race([apiCall, abortPromise]);
+        } finally {
+          if (onAbort) signal.removeEventListener('abort', onAbort);
+        }
       }
       return apiCall;
     };
@@ -3637,14 +4786,18 @@ This rule overrides ALL other instructions including formatting, brevity, or out
   }
 
   // --- OLLAMA STREAMING (uses /api/chat with proper messages array) ---
-  private async * streamWithOllama(message: string, context?: string, systemPrompt: string = TINY_SYSTEM_PROMPT, imagePaths?: string[]): AsyncGenerator<string, void, unknown> {
+  private async * streamWithOllama(message: string, context?: string, systemPrompt: string = TINY_SYSTEM_PROMPT, imagePaths?: string[], abortSignal?: AbortSignal, modelOverride?: string): AsyncGenerator<string, void, unknown> {
+    // When a screenshot is attached and the primary model is text-only, the
+    // caller passes the resolved vision-capable model here so the image is
+    // actually understood instead of silently dropped.
+    const ollamaModel = modelOverride || this.ollamaModel;
     let userContent = context ? `CONTEXT:\n${context}\n\nUSER:\n${message}` : message;
     // Per-request hard guard: trim userContent (never systemPrompt) until total fits the model's max ctx.
     {
-      const maxCtx = getModelCapabilities(this.ollamaModel, true).maxContextTokens;
+      const maxCtx = getModelCapabilities(ollamaModel, true).maxContextTokens;
       const total = estimateTokens(systemPrompt) + estimateTokens(userContent) + 2000;
       if (total > maxCtx) {
-        console.warn('[Ollama] context overflow', { model: this.ollamaModel, total, max: maxCtx });
+        console.warn('[Ollama] context overflow', { model: ollamaModel, total, max: maxCtx });
         const lines = userContent.split('\n');
         while (lines.length > 1 && (estimateTokens(systemPrompt) + estimateTokens(lines.join('\n')) + 2000) > maxCtx) {
           lines.shift();
@@ -3667,6 +4820,11 @@ This rule overrides ALL other instructions including formatting, brevity, or out
       if (encoded.length) images = encoded;
     }
 
+    // CACHE ORDERING INVARIANT (Ollama KV-prefix reuse): static system prompt
+    // leads as messages[0]; ALL per-request content (context, transcript, user
+    // question) stays in the trailing user message. Ollama reuses the KV cache
+    // for the longest byte-stable prefix — putting per-request data in the
+    // system message would bust prefix reuse every turn. See prewarmPromptCache.
     const userMessage: any = { role: 'user', content: userContent };
     if (images) userMessage.images = images;
 
@@ -3675,27 +4833,35 @@ This rule overrides ALL other instructions including formatting, brevity, or out
       userMessage,
     ];
 
-    console.log(`[LLMHelper] Ollama stream → model=${this.ollamaModel} sysLen=${systemPrompt.length} userLen=${userContent.length} images=${images?.length ?? 0}`);
+    console.log(`[LLMHelper] Ollama stream → model=${ollamaModel} sysLen=${systemPrompt.length} userLen=${userContent.length} images=${images?.length ?? 0}`);
 
     const decoder = new TextDecoder();
     let buffer = '';
     try {
       const streamBody: any = {
-        model: this.ollamaModel,
+        model: ollamaModel,
         messages,
         stream: true,
         options: {
-          temperature: getModelCapabilities(this.ollamaModel, true).tier === 'local-small' ? 0.2 : 0.7,
-          top_p: getModelCapabilities(this.ollamaModel, true).tier === 'local-small' ? 0.8 : undefined,
-          num_predict: getModelCapabilities(this.ollamaModel, true).tier === 'local-small' ? 180 : undefined,
+          temperature: getModelCapabilities(ollamaModel, true).tier === 'local-small' ? 0.2 : 0.7,
+          top_p: getModelCapabilities(ollamaModel, true).tier === 'local-small' ? 0.8 : undefined,
+          num_predict: getModelCapabilities(ollamaModel, true).tier === 'local-small' ? 180 : undefined,
         }
       };
-      if (this.isThinkingModel(this.ollamaModel)) streamBody.think = false;
+      if (this.isThinkingModel(ollamaModel)) streamBody.think = false;
+      // Combine the 120s hard ceiling with the caller's user-cancel signal.
+      // AbortSignal.any() returns a signal aborted as soon as ANY of its
+      // inputs abort, so the caller can cancel an Ollama generation that's
+      // taking too long (or just navigate away mid-stream) without waiting
+      // for the 2-minute timeout.
+      const ollamaSignal = abortSignal
+        ? AbortSignal.any([AbortSignal.timeout(120_000), abortSignal])
+        : AbortSignal.timeout(120_000);
       const response = await fetch(`${this.ollamaUrl}/api/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(streamBody),
-        signal: AbortSignal.timeout(120_000),
+        signal: ollamaSignal,
       });
 
       if (!response.ok) {
@@ -3706,6 +4872,10 @@ This rule overrides ALL other instructions including formatting, brevity, or out
 
       // @ts-ignore
       for await (const chunk of response.body) {
+        // Caller-cancel check between chunks. AbortSignal.any() above already
+        // closes the socket, but the for-await loop may have one buffered
+        // chunk in flight; bail here to avoid yielding tokens past the cancel.
+        if (abortSignal?.aborted) return;
         buffer += decoder.decode(chunk, { stream: true });
         let nl: number;
         while ((nl = buffer.indexOf('\n')) !== -1) {
@@ -3739,7 +4909,7 @@ This rule overrides ALL other instructions including formatting, brevity, or out
   }
 
   // --- CUSTOM PROVIDER STREAMING ---
-  private async * streamWithCustom(message: string, context?: string, imagePaths?: string[], systemPrompt: string = UNIVERSAL_SYSTEM_PROMPT): AsyncGenerator<string, void, unknown> {
+  private async * streamWithCustom(message: string, context?: string, imagePaths?: string[], systemPrompt: string = UNIVERSAL_SYSTEM_PROMPT, abortSignal?: AbortSignal): AsyncGenerator<string, void, unknown> {
     if (!this.customProvider) return;
     // We reuse the executeCustomProvider logic but we need it to stream.
     // If the user provided a curl command, it might support streaming (SSE) or not.
@@ -3787,6 +4957,17 @@ This rule overrides ALL other instructions including formatting, brevity, or out
 
     const streamAbort = new AbortController();
     const streamTimeout = setTimeout(() => streamAbort.abort(), 30_000);
+    // Forward the caller's user-cancel signal into the same controller so
+    // the fetch socket closes immediately on supersession, freeing the
+    // custom provider's quota and any rate-limiter slot.
+    const onCallerAbort = () => {
+      try { streamAbort.abort(abortSignal?.reason); } catch { /* already aborted */ }
+    };
+    abortSignal?.addEventListener('abort', onCallerAbort, { once: true });
+    if (abortSignal?.aborted) {
+      clearTimeout(streamTimeout);
+      return;
+    }
     try {
       const response = await fetch(url, {
         method: requestConfig.method || 'POST',
@@ -3810,6 +4991,9 @@ This rule overrides ALL other instructions including formatting, brevity, or out
 
       // @ts-ignore
       for await (const chunk of response.body) {
+        // Per-chunk caller-cancel check (the abort above already closed the
+        // socket, but a buffered chunk could still be in the iterator).
+        if (abortSignal?.aborted) return;
         const text = new TextDecoder().decode(chunk);
         fullBody += text;
 
@@ -3843,6 +5027,10 @@ This rule overrides ALL other instructions including formatting, brevity, or out
       clearTimeout(streamTimeout);
       console.error("Custom streaming failed", e);
       yield "Error streaming from custom provider.";
+    } finally {
+      // Always drop the listener so we don't leak a subscription on a
+      // long-lived AbortSignal shared across many calls.
+      abortSignal?.removeEventListener('abort', onCallerAbort);
     }
   }
 
@@ -3907,6 +5095,94 @@ This rule overrides ALL other instructions including formatting, brevity, or out
     } catch (error: any) {
       // Connection refused/timeout — OllamaManager logs startup status.
       return [];
+    }
+  }
+
+  /**
+   * Authoritatively probe whether a single Ollama model supports vision via
+   * /api/show `capabilities` (Ollama lists "vision" for multimodal models).
+   * Falls back to the name heuristic when capabilities are absent (older
+   * servers).
+   *
+   * Caching policy: only AUTHORITATIVE results (a real /api/show capabilities
+   * answer) are cached. A transient probe failure (server down / timeout /
+   * non-200) returns the name-heuristic guess but is NOT cached — otherwise a
+   * momentary Ollama hiccup during the first probe would make a vision-capable
+   * model with a non-standard name invisible to screenshots for the whole
+   * session.
+   */
+  private async probeOllamaVision(modelId: string): Promise<boolean> {
+    if (!modelId) return false;
+    const cached = this.ollamaVisionCache.get(modelId);
+    if (cached !== undefined) return cached;
+
+    const baseUrl = (this.ollamaUrl || "http://127.0.0.1:11434").replace('localhost', '127.0.0.1');
+    try {
+      const resp = await fetch(`${baseUrl}/api/show`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: modelId }),
+        signal: AbortSignal.timeout(5_000),
+      });
+      if (!resp.ok) return resolveOllamaVision(modelId, null); // transient — don't cache
+      const json: any = await resp.json().catch((): any => null);
+      const probed = ollamaVisionFromShow(json); // true/false (authoritative) or null
+      const result = resolveOllamaVision(modelId, probed);
+      // Cache only when the server gave us an authoritative capabilities answer.
+      if (probed !== null) this.ollamaVisionCache.set(modelId, result);
+      return result;
+    } catch {
+      // Probe failed (server down / timeout) — heuristic guess, not cached.
+      return resolveOllamaVision(modelId, null);
+    }
+  }
+
+  /**
+   * Resolve a vision-capable installed Ollama model and cache it in
+   * `this.ollamaVisionModel`. Prefers the currently-active model when it is
+   * itself vision-capable (no behavior change for users already on a vision
+   * model); otherwise picks the FIRST installed vision-capable model (in
+   * /api/tags order) so a screenshot can still be answered locally even when
+   * the primary model is text-only. Returns the chosen model id, or null when
+   * no installed model supports vision.
+   *
+   * Concurrent calls (init + switch + lazy-from-chain) share one in-flight
+   * probe to avoid redundant /api/show round-trips.
+   */
+  public async refreshOllamaVisionModel(): Promise<string | null> {
+    if (this.ollamaVisionRefreshInFlight) return this.ollamaVisionRefreshInFlight;
+    const run = (async (): Promise<string | null> => {
+      if (!this.useOllama) { this.ollamaVisionModel = null; return null; }
+      try {
+        const models = await this.getOllamaModels();
+        if (models.length === 0) { this.ollamaVisionModel = null; return null; }
+
+        // Prefer the active model if it's vision-capable.
+        if (this.ollamaModel && models.includes(this.ollamaModel) && await this.probeOllamaVision(this.ollamaModel)) {
+          this.ollamaVisionModel = this.ollamaModel;
+          return this.ollamaVisionModel;
+        }
+        // Otherwise pick the first installed vision-capable model.
+        for (const m of models) {
+          if (await this.probeOllamaVision(m)) {
+            this.ollamaVisionModel = m;
+            console.log(`[LLMHelper] Ollama vision model resolved: ${m} (primary model ${this.ollamaModel || 'n/a'} is text-only)`);
+            return m;
+          }
+        }
+        this.ollamaVisionModel = null;
+        return null;
+      } catch (e: any) {
+        console.warn('[LLMHelper] refreshOllamaVisionModel failed:', e?.message);
+        this.ollamaVisionModel = null;
+        return null;
+      }
+    })();
+    this.ollamaVisionRefreshInFlight = run;
+    try {
+      return await run;
+    } finally {
+      this.ollamaVisionRefreshInFlight = null;
     }
   }
 
@@ -4017,6 +5293,20 @@ This rule overrides ALL other instructions including formatting, brevity, or out
    */
   public hasClaude(): boolean {
     return this.claudeClient !== null;
+  }
+
+  /**
+   * Get the DeepSeek client (OpenAI SDK with custom baseURL) for mode-specific LLMs.
+   */
+  public getDeepseekClient(): OpenAI | null {
+    return this.deepseekClient;
+  }
+
+  /**
+   * Check if DeepSeek is available.
+   */
+  public hasDeepseek(): boolean {
+    return this.deepseekClient !== null;
   }
 
   /**
@@ -4215,6 +5505,26 @@ This rule overrides ALL other instructions including formatting, brevity, or out
    */
   public async generateMeetingSummary(systemPrompt: string, context: string, groqSystemPrompt?: string): Promise<string> {
     console.log(`[LLMHelper] generateMeetingSummary called. Context length: ${context.length}`);
+    // Short-circuit on empty/whitespace context. With no transcript content to
+    // summarise, the provider fallback chain (Natively → Codex → Groq → Gemini
+    // Flash → Gemini Pro) burns up to ~10 minutes of wall-clock time on retries
+    // for a result that will be discarded by the caller anyway. The caller
+    // (MeetingPersistence) already checks `transcript.length > 2` before using
+    // the summary, but the title-generation call site does NOT — so this guard
+    // is the load-bearing one.
+    if (!context || context.trim().length === 0) {
+      console.log('[LLMHelper] Empty context — skipping summary generation.');
+      return '';
+    }
+    const summaryDeniedScopes = getDeniedDataScopes(['post_call_summary'], this.getProviderScopePolicy());
+    if (summaryDeniedScopes.includes('post_call_summary')) {
+      const ollamaAvailable = this.useOllama && await this.checkOllamaAvailable();
+      this.logScopeFallback('post_call_summary', ollamaAvailable ? 'routing' : 'omitting');
+      if (ollamaAvailable) {
+        return this.processResponse(await this.callOllama(`Context:\n${context}`, undefined, systemPrompt));
+      }
+      context = '';
+    }
 
     // Helper: Estimate tokens (crude approximation: 4 chars = 1 token)
     const estimateTokens = (text: string) => Math.ceil(text.length / 4);
@@ -4385,6 +5695,9 @@ This rule overrides ALL other instructions including formatting, brevity, or out
   public async switchToOllama(model?: string, url?: string): Promise<void> {
     this.useOllama = true;
     if (url) this.ollamaUrl = url;
+    // URL/model change invalidates the per-model vision cache from a prior host.
+    this.ollamaVisionCache.clear();
+    this.ollamaVisionModel = null;
 
     if (model) {
       this.ollamaModel = model;
@@ -4392,6 +5705,11 @@ This rule overrides ALL other instructions including formatting, brevity, or out
       // Auto-detect first available model
       await this.initializeOllamaModel();
     }
+
+    // Resolve the best vision-capable installed model for screenshots (may
+    // differ from the primary text model). Fire-and-forget; the vision chain
+    // also refreshes lazily on first image request.
+    this.refreshOllamaVisionModel().catch(() => { });
 
     console.log(`[LLMHelper] Switched to Ollama: ${this.ollamaModel} at ${this.ollamaUrl}`);
   }

@@ -231,10 +231,15 @@ export class SessionTracker {
 
         this.evictOldEntries();
 
-        // Filter out internal system prompts that might be passed via IPC
-        const isInternalPrompt = text.startsWith("You are a real-time interview assistant") ||
-            text.startsWith("You are a helper") ||
-            text.startsWith("CONTEXT:");
+        // Filter out only exact internal system prompts (not broad prefix match)
+        // These are injected internally and should not be treated as real transcript
+        const knownInternalPrompts = [
+            "You are a real-time interview assistant",
+            "You are a helper",
+        ];
+        const isExactInternalPrompt = knownInternalPrompts.some(p => text === p);
+        const isContextInjection = text.startsWith("CONTEXT:");
+        const isInternalPrompt = isExactInternalPrompt || isContextInjection;
 
         if (!isInternalPrompt) {
             // Add to session transcript
@@ -374,10 +379,47 @@ export class SessionTracker {
     }
 
     /**
+     * Context items for LLM prompts, including the latest interim interviewer
+     * partial when finals have not caught up yet (matches What to Answer path).
+     */
+    getContextWithInterim(lastSeconds: number = 120): ContextItem[] {
+        const contextItems = [...this.getContext(lastSeconds)];
+
+        const lastInterim = this.lastInterimInterviewer;
+        if (lastInterim && lastInterim.text.trim().length > 0) {
+            const lastItem = contextItems[contextItems.length - 1];
+            const isDuplicate = lastItem &&
+                lastItem.role === 'interviewer' &&
+                (lastItem.text === lastInterim.text ||
+                    Math.abs(lastItem.timestamp - lastInterim.timestamp) < 1000);
+
+            if (!isDuplicate) {
+                contextItems.push({
+                    role: 'interviewer',
+                    text: lastInterim.text,
+                    timestamp: lastInterim.timestamp,
+                });
+            }
+        }
+
+        return contextItems;
+    }
+
+    /**
      * Get formatted context string for LLM prompts
      */
     getFormattedContext(lastSeconds: number = 120): string {
-        const items = this.getContext(lastSeconds);
+        return this.formatContextItems(this.getContext(lastSeconds));
+    }
+
+    /**
+     * Formatted context including rolling interim interviewer speech.
+     */
+    getFormattedContextWithInterim(lastSeconds: number = 120): string {
+        return this.formatContextItems(this.getContextWithInterim(lastSeconds));
+    }
+
+    private formatContextItems(items: ContextItem[]): string {
         return items.map(item => {
             const label = item.role === 'interviewer' ? 'INTERVIEWER' :
                 item.role === 'user' ? 'ME' :
